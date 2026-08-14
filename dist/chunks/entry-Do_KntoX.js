@@ -23144,7 +23144,7 @@ const MigrationView = defineComponent({
             busy.value = true;
             try {
                 // 动态 import：迁移代码独立 chunk，默认关闭主 bundle 不含（§24.1 代码分包）
-                const migration = await import('./migration-B8WcJhrZ.js');
+                const migration = await import('./migration-Bcem2gev.js');
                 let worldbookEntries = [];
                 let scripts = [];
                 try {
@@ -23339,21 +23339,26 @@ const CSS = `
 .nlk-log-row { display: flex; gap: 8px; align-items: center; padding: 2px 0; border-bottom: 1px solid var(--white10a, rgba(255,255,255,.08)); flex-wrap: wrap; }
 .nlk-diff { color: var(--accent, #4af); font-family: monospace; }
 .nlk-hint { color: var(--white50a, rgba(255,255,255,.5)); font-size: 12px; }
-.nlk-tabs { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.nlk-tabs { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+.nlkaleido-panel-body { padding: 2px 4px 8px; }
+.nlkaleido-drawer-hint { font-size: 11px; opacity: .6; margin-left: 6px; }
+.nlkaleido-float-status {
+  position: fixed; right: 14px; bottom: 14px; z-index: 30000;
+  background: rgba(22, 22, 28, .94); color: var(--white, #eee);
+  border: 1px solid var(--white30a, rgba(255,255,255,.3)); border-radius: 16px;
+  padding: 6px 14px; font-size: 12px; cursor: pointer; user-select: none;
+  box-shadow: 0 2px 10px rgba(0,0,0,.45);
+}
+.nlkaleido-float-status:hover { background: rgba(44, 44, 56, .96); border-color: var(--accent, #4af); }
 `;
 /**
  * 挂载面板（§11.1：独立容器 + createApp 实例级隔离）。
- * 容器为自建 div（script_id 标记），不写入 ST 既有扩展共享的 DOM 节点。
+ * 两个入口：
+ * ① 扩展设置抽屉（#extensions_settings2，ST 标准 inline-drawer 结构，
+ *    折叠动画由 ST 全局委托处理，见 docs For_Contributors/Writing-Extensions.md）；
+ * ② 聊天页右下角悬浮状态条（纯 DOM，一眼看到 轮次/待复核，点击滚到扩展抽屉）。
  */
 function mountPanel(deps) {
-    const containerId = 'nlkaleido_panel_container';
-    let container = document.getElementById(containerId);
-    if (!container) {
-        container = document.createElement('div');
-        container.id = containerId;
-        container.className = 'nlkaleido-panel';
-        document.body.appendChild(container);
-    }
     const styleId = 'nlkaleido_panel_style';
     if (!document.getElementById(styleId)) {
         const style = document.createElement('style');
@@ -23361,41 +23366,122 @@ function mountPanel(deps) {
         style.textContent = CSS;
         document.head.appendChild(style);
     }
-    // §11.1 实例级隔离：不写 window.Vue、不调全局 app.component
-    const app = createApp(PanelRoot);
-    const pinia = createPinia();
-    app.use(pinia);
-    app.provide(INJECT_BRIDGE, shallowRef(deps.bridge));
-    app.provide(INJECT_ADAPTER, shallowRef(deps.adapter));
-    app.mount(container);
-    // 订阅 nlkaleido:* 事件驱动刷新（§6.4 事件驱动不轮询）
-    const store = useNlStore(pinia);
-    const refresh = () => {
+    /** 构造 ST 标准 inline-drawer 外壳（.inline-drawer-toggle 由 ST 全局委托接管折叠） */
+    function buildEntry() {
+        const wrapper = document.createElement('div');
+        wrapper.id = 'nlkaleido_settings_entry';
+        const drawer = document.createElement('div');
+        drawer.className = 'inline-drawer';
+        const toggle = document.createElement('div');
+        toggle.className = 'inline-drawer-toggle inline-drawer-header';
+        const icon = document.createElement('div');
+        icon.className = 'inline-drawer-icon fa-solid fa-circle-chevron-down down';
+        const title = document.createElement('span');
+        title.textContent = 'NLKaleido 万花筒';
+        const hint = document.createElement('span');
+        hint.className = 'nlkaleido-drawer-hint';
+        hint.textContent = '变量契约系统（玩家/作者面板）';
+        toggle.append(icon, title, hint);
+        const content = document.createElement('div');
+        content.className = 'inline-drawer-content';
+        const body = document.createElement('div');
+        body.className = 'nlkaleido-panel-body';
+        content.appendChild(body);
+        drawer.append(toggle, content);
+        wrapper.appendChild(drawer);
+        return { wrapper, body };
+    }
+    // 聊天页右下角悬浮状态条（纯 DOM 零框架；点击滚动到扩展抽屉入口）
+    const floatId = 'nlkaleido_float_status';
+    let float = document.getElementById(floatId);
+    if (!float) {
+        float = document.createElement('div');
+        float.id = floatId;
+        float.className = 'nlkaleido-float-status';
+        float.addEventListener('click', () => {
+            const entry = document.getElementById('nlkaleido_settings_entry');
+            (entry ?? document.getElementById('extensions_settings2'))?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        document.body.appendChild(float);
+    }
+    function updateFloat() {
         const state = deps.adapter.adapter.state;
-        if (!state)
+        const compat = deps.adapter.getCompatibility();
+        if (!state) {
+            float.textContent = '万花筒 · 未加载状态';
             return;
-        store.statData = state.stat_data;
-        store.pending = state.meta.pending;
-        store.changelog = state.changelog;
-        store.lastTurnId = state.meta.lastTurnId;
-        const contract = deps.adapter.adapter.contract;
-        if (contract && !store.contractText) {
-            store.contractText = json(contract);
         }
+        const contract = deps.adapter.adapter.contract;
+        const enabled = contract?.memory?.enabled || contract?.plot?.enabled || contract?.dice?.enabled
+            ? ` · ${[contract.memory?.enabled ? '记忆' : '', contract.plot?.enabled ? '剧情' : '', contract.dice?.enabled ? '检定' : ''].filter(Boolean).join('+') || ''}`
+            : '';
+        float.textContent = `万花筒${compat && !compat.compatible ? ' ⚠' : ''} · 轮次 ${state.meta.lastTurnId} · 待复核 ${state.meta.pending.length}${enabled}`;
+    }
+    updateFloat();
+    let mounted = false;
+    const mount = (host) => {
+        if (mounted || host.querySelector('#nlkaleido_settings_entry'))
+            return;
+        mounted = true;
+        const { wrapper, body } = buildEntry();
+        host.appendChild(wrapper);
+        // §11.1 实例级隔离：不写 window.Vue、不调全局 app.component
+        const app = createApp(PanelRoot);
+        const pinia = createPinia();
+        app.use(pinia);
+        app.provide(INJECT_BRIDGE, shallowRef(deps.bridge));
+        app.provide(INJECT_ADAPTER, shallowRef(deps.adapter));
+        app.mount(body);
+        // 订阅 nlkaleido:* 事件驱动刷新（§6.4 事件驱动不轮询）
+        const store = useNlStore(pinia);
+        const refresh = () => {
+            const state = deps.adapter.adapter.state;
+            if (!state)
+                return;
+            store.statData = state.stat_data;
+            store.pending = state.meta.pending;
+            store.changelog = state.changelog;
+            store.lastTurnId = state.meta.lastTurnId;
+            const contract = deps.adapter.adapter.contract;
+            if (contract && !store.contractText) {
+                store.contractText = json(contract);
+            }
+            updateFloat();
+        };
+        refresh();
+        const eventSource = deps.adapter.stGlobals.getContext().eventSource;
+        eventSource.on('nlkaleido:status_changed', refresh);
+        eventSource.on('nlkaleido:pending_updated', refresh);
+        eventSource.on('nlkaleido:contract_changed', refresh);
+        // §20.10 记忆事件驱动刷新（不轮询）
+        eventSource.on('nlkaleido:memory_changed', () => { store.memoryVersion += 1; });
+        // §22.6 剧情事件驱动刷新（不轮询）
+        eventSource.on('nlkaleido:plot_changed', () => { store.plotVersion += 1; });
+        // §23.7 检定事件驱动刷新（不轮询）
+        eventSource.on('nlkaleido:dice_rolled', () => { store.diceVersion += 1; });
+        // §20.13.7 配置事件驱动刷新（不轮询）
+        eventSource.on('nlkaleido:config_changed', () => { store.configVersionCount += 1; });
     };
-    refresh();
-    const eventSource = deps.adapter.stGlobals.getContext().eventSource;
-    eventSource.on('nlkaleido:status_changed', refresh);
-    eventSource.on('nlkaleido:pending_updated', refresh);
-    eventSource.on('nlkaleido:contract_changed', refresh);
-    // §20.10 记忆事件驱动刷新（不轮询）
-    eventSource.on('nlkaleido:memory_changed', () => { store.memoryVersion += 1; });
-    // §22.6 剧情事件驱动刷新（不轮询）
-    eventSource.on('nlkaleido:plot_changed', () => { store.plotVersion += 1; });
-    // §23.7 检定事件驱动刷新（不轮询）
-    eventSource.on('nlkaleido:dice_rolled', () => { store.diceVersion += 1; });
-    // §20.13.7 配置事件驱动刷新（不轮询）
-    eventSource.on('nlkaleido:config_changed', () => { store.configVersionCount += 1; });
+    // 挂载到扩展设置抽屉；抽屉未就绪则轮询重试（ST 初始化时序差异防御）
+    const host = document.getElementById('extensions_settings2');
+    if (host) {
+        mount(host);
+    }
+    else {
+        let tries = 0;
+        const timer = window.setInterval(() => {
+            tries += 1;
+            const h = document.getElementById('extensions_settings2');
+            if (h) {
+                window.clearInterval(timer);
+                mount(h);
+            }
+            else if (tries > 80) {
+                window.clearInterval(timer);
+                console.error('[NLKaleido] 未找到扩展设置抽屉容器（#extensions_settings2），面板未挂载');
+            }
+        }, 250);
+    }
 }
 
 /**
