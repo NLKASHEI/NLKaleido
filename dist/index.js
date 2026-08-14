@@ -24555,7 +24555,6 @@ const CSS = `
 .nlk-hint { color: var(--white50a, rgba(255,255,255,.5)); font-size: 12px; }
 .nlk-tabs { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
 .nlkaleido-panel-body { padding: 2px 4px 8px; }
-.nlkaleido-drawer-hint { font-size: 11px; opacity: .6; margin-left: 6px; }
 .nlkaleido-float-status {
   position: fixed; right: 14px; bottom: 14px; z-index: 30000;
   background: rgba(22, 22, 28, .94); color: var(--white, #eee);
@@ -24586,8 +24585,12 @@ const CSS = `
 .nlkaleido-workbench-status { flex: 1; font-size: 12px; opacity: .72; }
 .nlkaleido-workbench-close { min-width: 34px; font-size: 18px; line-height: 1; }
 .nlkaleido-workbench-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; }
-.nlkaleido-settings-launcher { padding: 8px 0; }
-.nlkaleido-settings-launcher .nlk-btn { margin-right: 8px; }
+.nlkaleido-settings-entry-button {
+  box-sizing: border-box; width: 100%; min-height: 38px; margin: 4px 0; padding: 8px 10px;
+  display: flex; align-items: center; justify-content: flex-start; gap: 9px;
+  text-align: left; white-space: normal;
+}
+.nlkaleido-settings-entry-button > span:last-child { flex: 1; text-align: left; }
 .nlk-role-gate {
   min-height: 100%; box-sizing: border-box; padding: clamp(28px, 6vw, 72px);
   display: grid; place-content: center; gap: 30px;
@@ -24852,44 +24855,33 @@ function mountPanel(deps) {
         return mountedPanel;
     }
     const styleId = 'nlkaleido_panel_style';
-    if (!document.getElementById(styleId)) {
-        const style = document.createElement('style');
+    let style = document.getElementById(styleId);
+    if (!style) {
+        style = document.createElement('style');
         style.id = styleId;
-        style.textContent = CSS;
         document.head.appendChild(style);
     }
+    // 扩展热重载时复用页面，但必须刷新样式并清掉上一个模块留下的失效节点。
+    style.textContent = CSS;
+    document.getElementById('nlkaleido_settings_entry')?.remove();
+    document.getElementById('nlkaleido_workbench')?.remove();
+    document.getElementById('nlkaleido_float_status')?.remove();
     /** 构造 ST 设置页入口。主应用不挂这里，避免设置弹层关闭时用户看不到界面。 */
     function buildEntry(openWorkbench) {
         const wrapper = document.createElement('div');
         wrapper.id = 'nlkaleido_settings_entry';
-        const drawer = document.createElement('div');
-        drawer.className = 'inline-drawer';
-        const toggle = document.createElement('div');
-        toggle.className = 'inline-drawer-toggle inline-drawer-header';
-        const icon = document.createElement('div');
-        icon.className = 'inline-drawer-icon fa-solid fa-circle-chevron-down down';
-        const title = document.createElement('span');
-        title.textContent = 'NLKaleido 万花筒';
-        const hint = document.createElement('span');
-        hint.className = 'nlkaleido-drawer-hint';
-        hint.textContent = '变量契约系统（玩家/作者面板）';
-        toggle.append(icon, title, hint);
-        const content = document.createElement('div');
-        content.className = 'inline-drawer-content';
-        const body = document.createElement('div');
-        body.className = 'nlkaleido-settings-launcher';
         const launch = document.createElement('button');
         launch.type = 'button';
-        launch.className = 'menu_button nlk-btn';
-        launch.textContent = '打开万花筒工作台';
+        launch.className = 'menu_button nlkaleido-settings-entry-button';
+        launch.setAttribute('aria-label', '打开 NLKaleido 万花筒工作台');
+        const icon = document.createElement('span');
+        icon.className = 'fa-solid fa-wand-magic-sparkles';
+        icon.setAttribute('aria-hidden', 'true');
+        const label = document.createElement('span');
+        label.textContent = '打开 NLKaleido 万花筒';
+        launch.append(icon, label);
         launch.addEventListener('click', openWorkbench);
-        const status = document.createElement('span');
-        status.id = 'nlkaleido_settings_status';
-        status.className = 'nlk-hint';
-        body.append(launch, status);
-        content.appendChild(body);
-        drawer.append(toggle, content);
-        wrapper.appendChild(drawer);
+        wrapper.appendChild(launch);
         return wrapper;
     }
     // 独立工作台：不依赖任何 ST 容器，桌面/移动端都可直接打开。
@@ -24943,16 +24935,13 @@ function mountPanel(deps) {
     });
     // 聊天页右下角主入口。
     const floatId = 'nlkaleido_float_status';
-    let float = document.getElementById(floatId);
-    if (!float) {
-        float = document.createElement('button');
-        float.id = floatId;
-        float.type = 'button';
-        float.className = 'nlkaleido-float-status';
-        float.setAttribute('aria-label', '打开 NLKaleido 万花筒工作台');
-        float.addEventListener('click', openWorkbench);
-        document.body.appendChild(float);
-    }
+    const float = document.createElement('button');
+    float.id = floatId;
+    float.type = 'button';
+    float.className = 'nlkaleido-float-status';
+    float.setAttribute('aria-label', '打开 NLKaleido 万花筒工作台');
+    float.addEventListener('click', openWorkbench);
+    document.body.appendChild(float);
     function updateFloat() {
         const state = deps.adapter.adapter.state;
         const compat = deps.adapter.getCompatibility();
@@ -24968,9 +24957,6 @@ function mountPanel(deps) {
         const summary = `轮次 ${state.meta.lastTurnId} · 待复核 ${state.meta.pending.length}${enabled}`;
         float.textContent = `万花筒${compat && !compat.compatible ? ' ⚠' : ''} · 打开面板 · ${summary}`;
         runtimeStatus.textContent = `${compat?.compatible === false ? `兼容性缺失：${compat.missing.join(', ')}` : '运行正常'} · ${summary}`;
-        const settingsStatus = document.getElementById('nlkaleido_settings_status');
-        if (settingsStatus)
-            settingsStatus.textContent = summary;
     }
     updateFloat();
     // §11.1 实例级隔离：不写 window.Vue、不调全局 app.component。
@@ -25079,7 +25065,7 @@ let adapter = null;
 let startupState = 'idle';
 let startupError = null;
 let previousChatId = null;
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 /** 稳定 API 入口（每次取新鲜引用：chatMetadata 在切聊天后引用会变，文档警告不可长持） */
 function getStContext() {
     const globalObject = globalThis;
