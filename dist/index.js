@@ -1990,9 +1990,10 @@ class KaleidoStAdapter {
         if (!this.compat.compatible)
             return this.compat;
         const { eventSource, eventTypes } = this.globals.getContext();
-        // U8 绝对锚点：GENERATION_ENDED（覆盖成功/报错/中止/工具循环收尾）
-        eventSource.on(eventTypes.GENERATION_ENDED, () => {
-            void this.onGenerationEnded();
+        // U8 绝对锚点：GENERATION_ENDED（覆盖成功/报错/中止/工具循环收尾）。
+        // async 监听：ST 的 eventSource.emit 会等待 listener 返回的 Promise（文档要求 await emit）
+        eventSource.on(eventTypes.GENERATION_ENDED, async () => {
+            await this.onGenerationEnded();
         });
         // 中止标记（U8 守卫②）：STARTED 清标记，STOPPED 置标记
         eventSource.on(eventTypes.GENERATION_STARTED, () => {
@@ -2001,6 +2002,12 @@ class KaleidoStAdapter {
         eventSource.on(eventTypes.GENERATION_STOPPED, () => {
             this.adapter.abortedThisGeneration = true;
         });
+        // U3 注入点 B：SETTINGS_READY 兜底重排 + json_schema 注入（只处理自己的请求，§10.2 事件隔离）
+        if (typeof eventTypes.CHAT_COMPLETION_SETTINGS_READY === 'string') {
+            eventSource.on(eventTypes.CHAT_COMPLETION_SETTINGS_READY, (generateData) => {
+                this.onSettingsReady(generateData);
+            });
+        }
         return this.compat;
     }
     /** 优雅降级信息（面板用，§10.2 不白屏） */
@@ -19383,12 +19390,6 @@ function start() {
     const contract = loadContract(loaded);
     adapter.adapter.contract = contract;
     adapter.adapter.state = loaded ? reconcileState(contract, loaded) : bootstrapState(contract);
-    // U3 注入点 B：SETTINGS_READY 兜底重排 + json_schema 注入（只处理自己的请求，§10.2 事件隔离）
-    const context = getStContext();
-    context.eventSource
-        .on(context.eventTypes.CHAT_COMPLETION_SETTINGS_READY, (generateData) => {
-        adapter?.onSettingsReady(generateData);
-    });
     // 面板挂载（§11.1 独立容器 + createApp 实例级隔离；失败静默降级不炸主链，§0.5）
     try {
         mountPanel({ bridge, adapter });
