@@ -1793,6 +1793,102 @@ function writeValue(state, path, value) {
 }
 
 /**
+ * 白名单谓词（§17.8 PredicateExpr + §17.14-S2 文本谓词；语义对齐 ACU seed-condition.ts）。
+ *
+ * - AST 形式（非文本 DSL）：{ var, op, value } | { source, contains } | { and } | { or } | { not }。
+ * - 强类型断言（§17.4）：数值比较两端必须同类型，跨类型判 false；文本 contains 大小写不敏感
+ *   子串匹配（ACU evaluateSeedExpression_ACU：lowerContent.includes，模糊匹配）。
+ * - 安全：纯递归求值、无 eval、无 Function；嵌套深度 ≤5（§17.14-S2）；source 必须在渲染上下文
+ *   白名单内（不在 → 抛错，调用方保守常开）。
+ * - 只读 stat_data/meta；原型链污染防护由 path 层保证。
+ */
+class PredicateError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'PredicateError';
+    }
+}
+/**
+ * 文本谓词（§17.14-S2/ACU seed 语义）：大小写不敏感子串包含。
+ * source 不存在于渲染上下文 → 抛 PredicateError（§17.8：调用方降级保守常开）。
+ */
+function evaluateTextContains(source, contains, sources) {
+    if (!(source in sources))
+        throw new PredicateError(`谓词引用的 source 不存在于渲染上下文：${source}`);
+    const text = sources[source] ?? '';
+    return text.toLowerCase().includes(contains.toLowerCase());
+}
+/** 强类型比较（§17.4）：两端同类型才比较，跨类型判 false；in/not_in 按数组/字符串包含 */
+function compareStrict(left, op, right) {
+    switch (op) {
+        case '==': return typeof left === typeof right && left === right;
+        case '!=': return typeof left !== typeof right || left !== right;
+        case '>': return typeof left === 'number' && typeof right === 'number' && left > right;
+        case '>=': return typeof left === 'number' && typeof right === 'number' && left >= right;
+        case '<': return typeof left === 'number' && typeof right === 'number' && left < right;
+        case '<=': return typeof left === 'number' && typeof right === 'number' && left <= right;
+        case 'in': return Array.isArray(right) ? right.some((item) => item === left) : false;
+        case 'not_in': return Array.isArray(right) ? !right.some((item) => item === left) : false;
+        default: return false;
+    }
+}
+/**
+ * 谓词求值（§17.8 parsePredicate 运行时面）：纯函数、确定性、无 eval。
+ * 求值抛错向上抛（单条规则调用方隔离，§17.4）。
+ */
+function evaluatePredicate(expr, ctx) {
+    if ('and' in expr)
+        return expr.and.every((item) => evaluatePredicate(item, ctx));
+    if ('or' in expr)
+        return expr.or.some((item) => evaluatePredicate(item, ctx));
+    if ('not' in expr)
+        return !evaluatePredicate(expr.not, ctx);
+    if ('source' in expr)
+        return evaluateTextContains(expr.source, expr.contains, ctx.sources);
+    if ('var' in expr) {
+        // 路径归一化：剥 stat_data. 前缀（§0.2 normalizeRefPath 同语义）
+        const rawPath = expr.var.startsWith('stat_data.') ? expr.var.slice('stat_data.'.length) : expr.var;
+        if (expr.op === 'exists')
+            return hasAtPath(ctx.state.stat_data, rawPath);
+        const left = hasAtPath(ctx.state.stat_data, rawPath) ? getAtPath(ctx.state.stat_data, rawPath) : undefined;
+        if (left === undefined)
+            return false;
+        return compareStrict(left, expr.op, expr.value);
+    }
+    throw new PredicateError('谓词结构不合法');
+}
+
+/** 条目键（EntryRef → 稳定字符串键，§17.8） */
+function entryKey(entry) {
+    return `${entry.world}::${entry.name}`;
+}
+/**
+ * 本地判定（§17.8 evaluateEjs）：逐规则求值条件 → on_match/on_not_match 决定启用集合。
+ * 单条规则抛错 → 跳过 + log 记录（§17.4 错误隔离，不影响其它规则）。
+ */
+function evaluateEjs(c, state, sources) {
+    const active = new Set();
+    const log = [];
+    for (const rule of c.ejs ?? []) {
+        try {
+            const conditionMet = evaluatePredicate(rule.condition, { state, sources });
+            const shouldEnable = rule.mode === 'on_match' ? conditionMet : !conditionMet;
+            log.push({ ruleId: rule.id, hit: shouldEnable });
+            if (shouldEnable) {
+                for (const entry of rule.entries)
+                    active.add(entryKey(entry));
+            }
+        }
+        catch (error) {
+            const message = error instanceof PredicateError || error instanceof Error ? error.message : String(error);
+            log.push({ ruleId: rule.id, hit: false, error: message });
+            // 错误隔离：该规则跳过，条目保持上次激活状态（调用方以本轮 active 为准，§17.4）
+        }
+    }
+    return { active, log };
+}
+
+/**
  * Agent 更新循环（§0.1-A / §3.4 / §10.1，KaleidoCore 编排层）。
  *
  * - runSingleShotAgent：单次模式 = 一步 agent 请求（默认）：读状态 → 出 op → 校验 → 应用 → 记录；
@@ -1827,6 +1923,13 @@ async function runSingleShotAgent(transport, opts) {
     // 3. 观察层（§3.6 状态投影 + 可见性控制）
     const pendingPaths = state.meta.pending.map((p) => ({ op: p.op, rationale: p.rationale, reason: p.reason }));
     const observation = observe(contract, state, due, deps, pendingPaths, opts.observationOpts);
+    // 3a. EJS/CES 本地判定（§17.4/§17.8：变量更新 applyOps 之后、L3 构造之前——此处为本轮
+    //     L3 构造前；产物 activeEntries 只进 L3 尾部，绝不进 L0-L2，KV-Cache 硬约束）
+    const recentStoryText = (opts.recentStory ?? []).map((m) => m.content).join('\n');
+    const ejsResult = evaluateEjs(contract, state, {
+        recent_story: recentStoryText,
+        user_input: opts.userInput ?? '',
+    });
     // 4. 前缀 + 尾部（§5.1 L0-L3；Full Refresh 全量快照校准，CFS 审计项 8）
     const fullRefreshEveryN = opts.fullRefreshEveryN ?? 0;
     const { segments } = buildPrefixSegments(contract, state, due, { l0: opts.l0 });
@@ -1835,6 +1938,7 @@ async function runSingleShotAgent(transport, opts) {
         state,
         due,
         observation,
+        activeEntries: ejsResult.active,
         recentStory: opts.recentStory,
         userInput: opts.userInput,
         budget: contract.guardrails.maxStatusTokens,
@@ -6348,11 +6452,12 @@ const unknownType = ZodUnknown.create;
 ZodNever.create;
 const arrayType = ZodArray.create;
 const objectType = ZodObject.create;
-ZodUnion.create;
+const unionType = ZodUnion.create;
 ZodIntersection.create;
 ZodTuple.create;
 const recordType = ZodRecord.create;
 const lazyType = ZodLazy.create;
+const literalType = ZodLiteral.create;
 const enumType = ZodEnum.create;
 ZodPromise.create;
 ZodOptional.create;
@@ -6438,6 +6543,25 @@ const skeletonRefSchema = objectType({
     ref: stringType().min(1),
     version: numberType().int().positive().optional(),
 });
+// ---- EJS/CES 规则（§17.8，M11）----
+const predicateExprSchema = lazyType(() => unionType([
+    objectType({
+        var: stringType().min(1),
+        op: enumType(['==', '!=', '>', '>=', '<', '<=', 'in', 'not_in', 'exists']),
+        value: unknownType().optional(),
+    }),
+    objectType({ source: stringType().min(1), contains: stringType() }),
+    objectType({ and: arrayType(predicateExprSchema).min(1) }),
+    objectType({ or: arrayType(predicateExprSchema).min(1) }),
+    objectType({ not: predicateExprSchema }),
+]));
+const ejsRuleSchema = objectType({
+    id: stringType().min(1),
+    condition: predicateExprSchema,
+    entries: arrayType(objectType({ world: stringType().min(1), name: stringType().min(1) })).min(1),
+    mode: enumType(['on_match', 'on_not_match']),
+    entryPlacement: literalType('l3_tail'),
+});
 const contractSchema = objectType({
     version: numberType().int().positive(),
     id: stringType().min(1),
@@ -6448,7 +6572,7 @@ const contractSchema = objectType({
     invariants: arrayType(invariantSchema).default([]),
     // —— 以下 @since 各里程碑，MVP 阶段可缺失、填默认空（§7 MVPContract） ——
     achievements: arrayType(unknownType()).optional(),
-    ejs: arrayType(unknownType()).optional(),
+    ejs: arrayType(ejsRuleSchema).optional(),
     runBoundary: unknownType().optional(),
     derived: recordType(stringType(), unknownType()).optional(),
     sideEffects: arrayType(unknownType()).optional(),
