@@ -4499,6 +4499,7 @@ const fieldDefSchema = objectType({
     everyN: numberType().int().positive().optional(),
     dynamic: booleanType().optional(),
     changeRule: stringType().max(4000).optional(),
+    reviewRequired: booleanType().default(true),
     cap: capSchema,
     scope: arrayType(stringType().min(1)).optional(),
     ttl: numberType().int().nonnegative().optional(),
@@ -5140,7 +5141,7 @@ function renderContractRules(c) {
     const lines = ['# 变量更新规则（契约）'];
     for (const field of Object.values(c.updateRules)) {
         if (field.changeRule) {
-            lines.push(`- ${field.path}：${field.changeRule}`);
+            lines.push(`- ${field.path}：${field.changeRule}${field.reviewRequired === false ? '' : '【到期时必须审查并给出结论】'}`);
         }
     }
     return lines.join('\n');
@@ -5215,6 +5216,14 @@ function squashRecentStory(messages, maxMessages = 12) {
 function buildTail(input) {
     const { contract, state, due, observation, activeEntries, recentStory, userInput, budget } = input;
     const lines = [];
+    if (due.length) {
+        lines.push('# 本轮必须逐项审查的变量');
+        for (const path of due) {
+            const field = contract.updateRules[path];
+            if (field?.reviewRequired !== false)
+                lines.push(`- ${path}（必须在 reviewed 中给出 update 或 unchanged 结论）`);
+        }
+    }
     // 0. Full Refresh 全量快照校准（§5.4 审计项 8：每 K 轮把当前全量数据塞一份做完整快照，防长会话漂移）
     if (input.fullRefresh) {
         lines.push('<!-- NLKaleido Full Refresh: 全量 stat_data 快照（周期校准） -->');
@@ -6228,7 +6237,43 @@ async function runSingleShotAgent(transport, opts) {
         }
         // 5. 解析 + 语法清洗（§4.8 ①）
         const { ops, errors } = sanitizeJsonPatchDetailed(response.jsonPatch, contract);
+        const requiredReviews = due.filter((path) => {
+            const field = contract.updateRules[path];
+            const writers = field?.ownership?.writers ?? [field?.ownership?.owner ?? 'agent'];
+            return field?.reviewRequired !== false && (writers.includes('*') || writers.includes('agent') || field?.ownership?.owner === 'agent');
+        });
+        const reviewed = Array.isArray(response.payload?.reviewed)
+            ? response.payload.reviewed.filter((item) => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+            : [];
+        const reviewByPath = new Map(reviewed.map((item) => [String(item.path ?? ''), item]));
+        const reviewErrors = [];
+        for (const path of requiredReviews) {
+            const review = reviewByPath.get(path);
+            if (!review) {
+                reviewErrors.push(`必审变量 ${path} 未出现在 reviewed 中`);
+                continue;
+            }
+            const decision = review.decision;
+            const rationale = typeof review.rationale === 'string' ? review.rationale.trim() : '';
+            if (decision !== 'update' && decision !== 'unchanged')
+                reviewErrors.push(`必审变量 ${path} 的 decision 必须是 update 或 unchanged`);
+            if (rationale.length < 4)
+                reviewErrors.push(`必审变量 ${path} 缺少具体判断理由`);
+            const hasPatch = ops.some((op) => op.path === path);
+            if (decision === 'update' && !hasPatch)
+                reviewErrors.push(`必审变量 ${path} 标记 update 但没有对应 json_patch`);
+            if (decision === 'unchanged' && hasPatch)
+                reviewErrors.push(`必审变量 ${path} 标记 unchanged 却提交了修改`);
+        }
+        if (reviewErrors.length) {
+            feedback = [...reviewErrors, ...errors];
+            result.failureReasons.push(...reviewErrors, ...errors);
+            continue;
+        }
         if (!ops.length) {
+            // 覆盖全部必审变量并明确判断为 unchanged 时，这是有效的“本轮无变化”，不再逼模型乱改。
+            if (requiredReviews.length > 0 && errors.length === 0)
+                break;
             feedback = [...errors, ...feedback];
             result.failureReasons.push(...errors);
             continue; // 无有效 op：重试或结束
@@ -9308,6 +9353,19 @@ class KaleidoStAdapter {
     buildJsonSchema(_contract, options = {}) {
         const properties = {
             analysis: { type: 'string', description: '剧情理解与更新理由' },
+            reviewed: {
+                type: 'array',
+                description: '逐项审查本轮必审变量；即使不修改也必须给出 unchanged 与具体理由',
+                items: {
+                    type: 'object',
+                    properties: {
+                        path: { type: 'string' },
+                        decision: { type: 'string', enum: ['update', 'unchanged'] },
+                        rationale: { type: 'string' },
+                    },
+                    required: ['path', 'decision', 'rationale'],
+                },
+            },
             json_patch: {
                 type: 'array',
                 items: {
@@ -9331,11 +9389,11 @@ class KaleidoStAdapter {
         }
         return {
             name: 'nlkaleido_variable_update',
-            description: '变量状态更新：返回 {analysis, json_patch:[{op,path,value,confidence,rationale}]}',
+            description: '变量状态更新：必须逐项 reviewed，再返回必要的 json_patch',
             value: {
                 type: 'object',
                 properties,
-                required: ['analysis', 'json_patch'],
+                required: ['analysis', 'reviewed', 'json_patch'],
             },
         };
     }
@@ -9740,6 +9798,8 @@ class KaleidoStAdapter {
                         content: [
                             '你是 NLKaleido 状态管理 Agent。你必须只输出结构化动作，不写叙事正文。',
                             '每步三选一：apply_patch 提交最小必要修改；get_state 请求刷新；确认无需继续时 done。',
+                            '必须先逐项检查当前所有到期变量；满足更新规则就必须 apply_patch，不得因变化小、字段多或想提前结束而直接 done。',
+                            '只有逐项检查后确认全部没有满足条件时才能 done，并在 rationale 中逐项说明保持不变的剧情证据。',
                             '禁止猜测未发生的事实；遵守字段类型、更新模式、所有权与不变量；被拒后必须根据反馈修正。',
                             `契约：${contract.id}@${contract.version}`,
                             `当前步骤：${step}`,
@@ -22914,7 +22974,7 @@ function cloneData(value) {
 }
 function createField(path = '新分组.新字段') {
     return {
-        path, type: 'string', default: '', updateMode: 'every_turn', dynamic: true,
+        path, type: 'string', default: '', updateMode: 'every_turn', dynamic: true, reviewRequired: true,
         display: true, persist: 'chat', stability: 'volatile',
         ownership: { owner: 'agent', writers: ['agent', 'manual', 'frontend'], priority: 0, merge: 'last_write', audit: true },
     };
@@ -22952,29 +23012,6 @@ function duplicateField(contract, path) {
     copy.path = nextPath;
     return { contract: upsertField(contract, null, copy), path: nextPath };
 }
-function parseDefaultValue(type, text) {
-    if (type === 'string')
-        return text;
-    if (type === 'number') {
-        const value = Number(text);
-        if (!Number.isFinite(value))
-            throw new Error('默认值必须是有限数字');
-        return value;
-    }
-    if (type === 'boolean') {
-        if (text === 'true')
-            return true;
-        if (text === 'false')
-            return false;
-        throw new Error('布尔值只能是 true 或 false');
-    }
-    try {
-        return JSON.parse(text);
-    }
-    catch {
-        throw new Error(`${type} 默认值必须是合法 JSON`);
-    }
-}
 function fieldGroups(contract) {
     const groups = new Map();
     for (const field of Object.values(contract.updateRules)) {
@@ -22998,6 +23035,16 @@ function fieldGroups(contract) {
 const INJECT_BRIDGE = 'nlkaleido:bridge';
 const INJECT_ADAPTER = 'nlkaleido:adapter';
 let mountedPanel = null;
+let mountedBridge = null;
+function initialTheme() {
+    try {
+        const saved = localStorage.getItem('nlkaleido:theme');
+        if (saved === 'midnight' || saved === 'light' || saved === 'parchment' || saved === 'system')
+            return saved;
+    }
+    catch { /* 隐私模式下保持默认主题 */ }
+    return 'midnight';
+}
 /** Pinia store（§6.2 状态拆分；命名全 nlkaleido: 前缀，§11.1） */
 const useNlStore = defineStore('nlkaleido:panel', () => {
     const compat = ref(null);
@@ -23008,6 +23055,8 @@ const useNlStore = defineStore('nlkaleido:panel', () => {
     const authorMode = ref(false);
     /** 进入工作台先明确身份，避免把创作工具和玩家功能混在一起。 */
     const roleMode = ref('choose');
+    const theme = ref(initialTheme());
+    const authorSection = ref('fields');
     const contractText = ref('');
     const contractError = ref('');
     /** @since M13 面板页签：player / author / memory（§20.10 记忆独立 Tab） */
@@ -23021,7 +23070,14 @@ const useNlStore = defineStore('nlkaleido:panel', () => {
     /** @since M14 配置刷新计数（nlkaleido:config_changed → +1 触发重渲染） */
     const configVersionCount = ref(0);
     const runtimeMessage = ref('');
-    return { compat, statData, pending, changelog, lastTurnId, authorMode, roleMode, contractText, contractError, activeTab, memoryVersion, plotVersion, diceVersion, configVersionCount, runtimeMessage };
+    const setTheme = (next) => {
+        theme.value = next;
+        try {
+            localStorage.setItem('nlkaleido:theme', next);
+        }
+        catch { /* 不阻塞界面 */ }
+    };
+    return { compat, statData, pending, changelog, lastTurnId, authorMode, roleMode, theme, setTheme, authorSection, contractText, contractError, activeTab, memoryVersion, plotVersion, diceVersion, configVersionCount, runtimeMessage };
 });
 function json(value) {
     return JSON.stringify(value, null, 2);
@@ -23046,8 +23102,11 @@ function readState() {
     return { contract: adapter.adapter.contract, state: adapter.adapter.state };
 }
 function dispatch(payload) {
-    const bridge = inject(INJECT_BRIDGE, shallowRef(null)).value;
-    return bridge.dispatch(payload);
+    // 点击发生在 setup/render 之后，Vue inject() 已没有活动组件上下文。
+    // 使用 mountPanel 验证过的单例桥，避免按钮事件取到空注入。
+    if (!mountedBridge)
+        return { ok: false, error: '面板尚未连接变量系统' };
+    return mountedBridge.dispatch(payload);
 }
 /** 状态板（玩家视图，§6.1：只读展示，不暴露契约/调试） */
 const PlayerView = defineComponent({
@@ -23115,7 +23174,8 @@ const ContractEditor = defineComponent({
         const adapter = useAdapter();
         const draft = ref(null);
         const selectedPath = ref('');
-        const section = ref('fields');
+        const section = ref(store.authorSection);
+        watch(section, (value) => { store.authorSection = value; });
         const dirty = ref(false);
         const feedback = ref('');
         const feedbackKind = ref('info');
@@ -23253,7 +23313,7 @@ const ContractEditor = defineComponent({
             if (name === 'plot')
                 draft.value.plot = { ...(draft.value.plot ?? { everyN: 5, winds: true }), enabled };
             if (name === 'dice')
-                draft.value.dice = { enabled };
+                draft.value.dice = { ...(draft.value.dice ?? {}), enabled };
             changed();
         };
         const editAdvanced = (text) => {
@@ -23277,6 +23337,70 @@ const ContractEditor = defineComponent({
             help ? h('small', { class: 'nlk-help' }, help) : null,
             h('select', { class: 'nlk-input', value, onChange: (e) => onChange(e.target.value) }, values.map(([key, text]) => h('option', { value: key }, text))),
         ]);
+        const emptyValueForType = (type) => type === 'string' ? '' : type === 'number' ? 0 : type === 'boolean' ? false : type === 'list' ? [] : {};
+        const parseLooseValue = (value) => {
+            const text = value.trim();
+            if (!text)
+                return '';
+            try {
+                return JSON.parse(text);
+            }
+            catch {
+                return value;
+            }
+        };
+        const setFrontendWritable = (path, enabled) => {
+            if (!draft.value)
+                return;
+            const currentField = draft.value.updateRules[path];
+            if (!currentField)
+                return;
+            const current = currentField.ownership ?? { owner: 'agent', writers: ['agent', 'manual'], priority: 0, merge: 'last_write', audit: true };
+            const writers = current.writers ?? [current.owner];
+            draft.value = upsertField(draft.value, path, {
+                ...currentField,
+                ownership: { ...current, writers: enabled ? Array.from(new Set([...writers, 'frontend'])) : writers.filter((writer) => writer !== 'frontend' && writer !== '*') },
+            });
+            changed();
+        };
+        const defaultEditor = (field) => {
+            if (field.type === 'boolean')
+                return h('div', { class: 'nlk-value-builder' }, [
+                    h('div', { class: 'nlk-label' }, '第一次使用时的值'),
+                    h('small', { class: 'nlk-help' }, '选择初始状态。之后 AI、作者或已授权前端可以切换它。'),
+                    h('div', { class: 'nlk-segmented' }, [true, false].map((value) => h('button', { type: 'button', class: field.default === value ? 'nlk-segmented-active' : '', onClick: () => patchField({ default: value }) }, value ? '是 / 开启' : '否 / 关闭'))),
+                ]);
+            if (field.type === 'list') {
+                const items = Array.isArray(field.default) ? field.default : [];
+                return h('div', { class: 'nlk-value-builder nlk-form-span' }, [
+                    h('div', { class: 'nlk-label' }, '第一次使用时有哪些项目'),
+                    h('small', { class: 'nlk-help' }, '“一组项目”就是有顺序的清单，例如背包物品、任务名称或同行角色。每一行是一项，可继续添加。'),
+                    h('div', { class: 'nlk-builder-list' }, items.map((item, index) => h('div', { class: 'nlk-builder-row', key: index }, [
+                        h('span', { class: 'nlk-builder-index' }, String(index + 1)),
+                        h('input', { class: 'nlk-input', value: typeof item === 'string' ? item : JSON.stringify(item), placeholder: '例：旧地图', onInput: (e) => { const next = [...items]; next[index] = parseLooseValue(e.target.value); patchField({ default: next }); } }),
+                        h('button', { type: 'button', class: 'nlk-icon-btn nlk-danger', title: '删除这一项', onClick: () => patchField({ default: items.filter((_, i) => i !== index) }) }, '×'),
+                    ]))),
+                    h('button', { type: 'button', class: 'nlk-btn nlk-btn-sm', onClick: () => patchField({ default: [...items, ''] }) }, '+ 添加一项'),
+                ]);
+            }
+            if (field.type === 'kv' || field.type === 'object') {
+                const record = field.default && typeof field.default === 'object' && !Array.isArray(field.default) ? field.default : {};
+                const entries = Object.entries(record);
+                return h('div', { class: 'nlk-value-builder nlk-form-span' }, [
+                    h('div', { class: 'nlk-label' }, field.type === 'kv' ? '第一次使用时有哪些“名称 → 值”' : '第一次使用时包含哪些属性'),
+                    h('small', { class: 'nlk-help' }, field.type === 'kv' ? '适合数量会动态增加的字典，例如“金币→120、木材→8”。左边是名称，右边是值。' : '适合描述一个有多个属性的对象，例如地点包含“名称、天气、危险度”。'),
+                    h('div', { class: 'nlk-builder-list' }, entries.map(([key, value], index) => h('div', { class: 'nlk-builder-row nlk-builder-pair', key }, [
+                        h('input', { class: 'nlk-input', value: key, placeholder: '名称', onInput: (e) => { const nextKey = e.target.value; const next = { ...record }; delete next[key]; next[nextKey] = value; patchField({ default: next }); } }),
+                        h('span', { class: 'nlk-builder-arrow' }, '→'),
+                        h('input', { class: 'nlk-input', value: typeof value === 'string' ? value : JSON.stringify(value), placeholder: '值', onInput: (e) => patchField({ default: { ...record, [key]: parseLooseValue(e.target.value) } }) }),
+                        h('button', { type: 'button', class: 'nlk-icon-btn nlk-danger', title: '删除这一项', onClick: () => { const next = { ...record }; delete next[key]; patchField({ default: next }); } }, '×'),
+                    ]))),
+                    h('button', { type: 'button', class: 'nlk-btn nlk-btn-sm', onClick: () => { let key = `项目${entries.length + 1}`; while (key in record)
+                            key += '_'; patchField({ default: { ...record, [key]: '' } }); } }, '+ 添加名称和值'),
+                ]);
+            }
+            return input('第一次使用时的值', field.type === 'number' ? Number(field.default ?? 0) : String(field.default ?? ''), (value) => patchField({ default: field.type === 'number' ? Number(value) || 0 : value }), field.type === 'number' ? { type: 'number' } : {}, field.type === 'number' ? '例如好感度从 0、生命值从 100 开始。只能输入有限数字。' : '新聊天还没有这个变量时，从这里开始。');
+        };
         return () => {
             const contract = draft.value;
             if (!contract)
@@ -23305,28 +23429,19 @@ const ContractEditor = defineComponent({
                             ])]),
                         h('div', { class: 'nlk-form-grid' }, [
                             input('变量名称（分组.名称）', field.path, (value) => patchField({ path: value }), {}, '唯一名称。AI、显示模板和前端脚本都用它定位这个值，例如「角色.好感度」。'),
-                            select('保存什么内容', field.type, [['string', '一段文字'], ['number', '一个数字'], ['boolean', '是 / 否'], ['list', '一组项目'], ['kv', '键和值'], ['object', '一组结构化信息']], (value) => patchField({ type: value }), '类型决定能写入什么值；写错类型会被拒绝，不会污染存档。'),
-                            input('第一次使用时的值', typeof field.default === 'string' ? field.default : JSON.stringify(field.default ?? ''), (value) => {
-                                try {
-                                    patchField({ default: parseDefaultValue(field.type, value) });
-                                }
-                                catch (error) {
-                                    tell(error instanceof Error ? error.message : String(error), 'error');
-                                }
-                            }, {}, '新聊天还没有这个变量时，从这里开始。列表和结构化信息请填写 JSON。'),
+                            select('保存什么内容', field.type, [['string', '一段文字'], ['number', '一个数字'], ['boolean', '是 / 否'], ['list', '一组有顺序的项目'], ['kv', '可以动态增加的名称和值'], ['object', '一个包含多个属性的对象']], (value) => { const type = value; patchField({ type, default: emptyValueForType(type) }); }, '选择后，下方会出现对应的可视化构造器；不需要手写 JSON。'),
+                            defaultEditor(field),
                             select('什么时候让 AI 检查它', field.updateMode, [['every_turn', '每轮剧情结束后'], ['every_n_turns', '每隔几轮'], ['trigger', '只有说明中的条件出现时'], ['fixed', 'AI 不自动修改']], (value) => patchField({ updateMode: value, everyN: value === 'every_n_turns' ? field.everyN ?? 3 : undefined }), '这里只控制 AI 自动更新；作者和已授权的前端脚本仍可主动写入。'),
                             field.updateMode === 'every_n_turns' ? input('每隔多少轮检查', field.everyN ?? 3, (value) => patchField({ everyN: Math.max(1, Number(value) || 1) }), { type: 'number', min: 1 }, '数值越大越省模型上下文，变化也会更晚反映。') : null,
                             select('离开当前聊天后是否保留', field.persist ?? 'chat', [['chat', '只在当前聊天'], ['run', '同一周目继续保留'], ['global', '跨聊天和角色卡共享']], (value) => patchField({ persist: value }), '大多数剧情变量选“只在当前聊天”；账号级设置才适合全局共享。'),
                             select('发送给 AI 的缓存方式', field.stability ?? 'volatile', [['volatile', '经常变化'], ['stable', '较少变化，优先节省上下文'], ['frozen', '完全不发给变量 AI']], (value) => patchField({ stability: value }), '一般保持“经常变化”。只有确定不常改的长文本才选稳定或冻结。'),
                             h('label', { class: 'nlk-check nlk-check-explain' }, [h('input', { type: 'checkbox', checked: field.display, onChange: (e) => patchField({ display: e.target.checked }) }), h('span', null, [h('strong', null, '在玩家页面显示'), h('small', null, '关闭后仍会保存，只是不展示给玩家。')])]),
+                            h('label', { class: 'nlk-check nlk-check-explain nlk-check-important' }, [h('input', { type: 'checkbox', checked: field.reviewRequired !== false, onChange: (e) => patchField({ reviewRequired: e.target.checked }) }), h('span', null, [h('strong', null, '到期时必须逐项判断'), h('small', null, '推荐开启。Agent 必须明确回答“更新 / 不变”并说明证据；满足规则却不提交修改会被退回重试。')])]),
                             h('label', { class: 'nlk-check nlk-check-explain' }, [h('input', {
                                     type: 'checkbox',
                                     checked: (field.ownership?.writers ?? []).includes('*') || (field.ownership?.writers ?? []).includes('frontend'),
                                     onChange: (e) => {
-                                        const enabled = e.target.checked;
-                                        const current = field.ownership ?? { owner: 'agent', writers: ['agent', 'manual'], priority: 0, merge: 'last_write', audit: true };
-                                        const writers = current.writers ?? [current.owner];
-                                        patchField({ ownership: { ...current, writers: enabled ? Array.from(new Set([...writers, 'frontend'])) : writers.filter((writer) => writer !== 'frontend' && writer !== '*') } });
+                                        setFrontendWritable(field.path, e.target.checked);
                                     },
                                 }), h('span', null, [h('strong', null, '允许前端脚本写入'), h('small', null, '开启后，角色卡界面可通过正式 API 修改这个变量。每次写入都会校验并记入审计。')])]),
                         ]),
@@ -23337,6 +23452,27 @@ const ContractEditor = defineComponent({
                             h('code', null, `const value = NLKaleido.variables.get('${field.path}');\nawait NLKaleido.variables.set('${field.path}', ${JSON.stringify(field.default)});`),
                         ]),
                     ]) : h('div', { class: 'nlk-empty' }, '从左侧选择一个变量，或点“+”新建。'),
+                ]);
+            }
+            else if (section.value === 'api') {
+                const fields = Object.values(contract.updateRules);
+                content = h('div', { class: 'nlk-stack' }, [
+                    h('article', { class: 'nlk-api-overview' }, [
+                        h('div', { class: 'nlk-info-icon' }, '</>'),
+                        h('div', null, [
+                            h('div', { class: 'nlk-pane-title' }, '角色卡前端 API'),
+                            h('p', null, '这里不需要填写网址、模型或 API Key。角色卡里的 HTML/JavaScript 直接使用当前页面的 NLKaleido.variables。你只需决定每个变量是否允许前端修改。'),
+                            h('code', null, "const state = NLKaleido.variables.get('角色.好感度');\nconst result = await NLKaleido.variables.set('角色.好感度', 80);\nif (!result.ok) console.warn(result.error);"),
+                        ]),
+                    ]),
+                    fields.length ? h('div', { class: 'nlk-api-field-grid' }, fields.map((item) => {
+                        const enabled = (item.ownership?.writers ?? []).includes('*') || (item.ownership?.writers ?? []).includes('frontend');
+                        return h('article', { class: enabled ? 'nlk-api-field nlk-api-field-on' : 'nlk-api-field', key: item.path }, [
+                            h('div', null, [h('strong', null, item.path), h('small', null, `${item.type} · ${item.display ? '玩家可见' : '仅后台保存'}`)]),
+                            h('label', { class: 'nlk-switch-line' }, [h('span', null, enabled ? '允许前端写入' : '只允许读取'), h('input', { type: 'checkbox', checked: enabled, onChange: (e) => setFrontendWritable(item.path, e.target.checked) })]),
+                        ]);
+                    })) : h('div', { class: 'nlk-empty' }, '先在“变量与显示”中创建变量，这里才会出现可授权项。'),
+                    h('div', { class: 'nlk-callout' }, '写入不是直接改对象：系统会先检查变量是否声明、类型是否正确、是否获得权限、是否违反跨变量规则，然后重算派生值、写入修改记录并保存。'),
                 ]);
             }
             else if (section.value === 'ces') {
@@ -23365,6 +23501,7 @@ const ContractEditor = defineComponent({
                     h('div', null, [h('strong', null, name), h('p', null, desc)]), h('label', { class: 'nlk-switch' }, [h('input', { type: 'checkbox', checked: enabled, onChange: (e) => toggle(e.target.checked) }), h('span')]),
                 ]);
                 content = h('div', { class: 'nlk-stack' }, [
+                    h('div', { class: 'nlk-callout' }, '勾选需要的功能后，点击页面右上角“检查并保存”才会生效。关闭的功能不会加载对应数据和计算。'),
                     systemCard('长期记忆', '让系统记住跨越很多轮的重要事实，并在相关时自动找回来。', contract.memory?.enabled === true, (on) => toggleSystem('memory', on)),
                     systemCard('世界推演', '让聊天外的事件继续发展，并把玩家可能听到的消息带回剧情。', contract.plot?.enabled === true, (on) => toggleSystem('plot', on)),
                     systemCard('掷骰与检定', '提供安全的骰子公式、常用预设和检定历史。', contract.dice?.enabled === true, (on) => toggleSystem('dice', on)),
@@ -23387,7 +23524,7 @@ const ContractEditor = defineComponent({
                 ]),
                 h('section', { class: 'nlk-ai-draft' }, [h('div', null, [h('strong', null, '告诉 AI 你想记录什么'), h('small', null, '它只会生成一份待检查的草稿')]), h('input', { class: 'nlk-input', value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: '例：追踪三名角色的好感度、队伍资金和世界阶段，每 3 轮检查一次阶段' }), h('button', { class: 'nlk-btn', disabled: aiBusy.value, onClick: generateDraft }, aiBusy.value ? '生成中…' : '帮我生成')]),
                 feedback.value ? h('div', { class: `nlk-toast nlk-toast-${feedbackKind.value}` }, feedback.value) : null,
-                h('nav', { class: 'nlk-subnavs' }, [nav('fields', '① 变量与显示', Object.keys(contract.updateRules).length), nav('ces', '② 自动启用世界书', (contract.ejs ?? []).length), nav('systems', '③ 可选功能'), nav('advanced', '开发者设置')]),
+                h('nav', { class: 'nlk-subnavs' }, [nav('fields', '① 变量与显示', Object.keys(contract.updateRules).length), nav('api', '② 前端 API'), nav('ces', '③ 自动启用世界书', (contract.ejs ?? []).length), nav('systems', '④ 可选功能'), nav('advanced', '开发者设置')]),
                 content,
             ]);
         };
@@ -23488,7 +23625,7 @@ const MemoryView = defineComponent({
         return () => {
             if (!enabled()) {
                 return h('div', { class: 'nlk-section' }, [
-                    h('div', { class: 'nlk-hint' }, '记忆系统未启用：作者需在契约 memory.enabled=true 声明（§20，默认关闭零开销）。'),
+                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '◉'), h('h2', null, '长期记忆目前是关闭的'), h('p', null, '开启后，系统会保存跨越多轮的重要事实，并在剧情相关时自动找回来。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'systems'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去作者页开启')]),
                 ]);
             }
             const list = atoms().slice().sort((a, b) => b.lastAccessedAt - a.lastAccessedAt).slice(0, 60);
@@ -23556,7 +23693,7 @@ const PlotView = defineComponent({
         return () => {
             if (!enabled()) {
                 return h('div', { class: 'nlk-section' }, [
-                    h('div', { class: 'nlk-hint' }, '剧情编排未启用：作者需在契约 plot.enabled=true 声明（§22，默认关闭零开销）。'),
+                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '⌁'), h('h2', null, '世界推演目前是关闭的'), h('p', null, '开启后，聊天之外的事件也会继续发展，并把玩家可能听到的消息带回故事。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'systems'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去作者页开启')]),
                 ]);
             }
             const list = events();
@@ -23638,7 +23775,7 @@ const DiceView = defineComponent({
         return () => {
             if (!enabled()) {
                 return h('div', { class: 'nlk-section' }, [
-                    h('div', { class: 'nlk-hint' }, '检定系统未启用：作者需在契约 dice.enabled=true 声明（§23，默认关闭零开销）。'),
+                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '⬡'), h('h2', null, '掷骰与检定目前是关闭的'), h('p', null, '开启后可以使用安全骰子公式、检定预设和历史记录。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'systems'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去作者页开启')]),
                 ]);
             }
             return h('div', { class: 'nlk-section' }, [
@@ -23773,6 +23910,7 @@ const ConfigView = defineComponent({
         const adapter = useAdapter();
         const actionMessage = ref('');
         const confirmReset = ref(false);
+        const pendingTier = ref(null);
         onMounted(() => {
             void adapter.loadConfig()
                 .then(() => { store.configVersionCount += 1; })
@@ -23787,8 +23925,28 @@ const ConfigView = defineComponent({
         const report = () => adapter.adapter.lastConfigReport;
         const snapshot = () => adapter.adapter.configSnapshot;
         const applyTier = (tier) => {
-            dispatch({ action: 'configApplyTier', tier });
+            // saveConfig 会先发一次 CONFIG_CHANGED，完整自检报告随后才产生；清空旧报告，
+            // watcher 在第一拍保持“正在切换”，等第二拍再展示最终结果。
+            adapter.adapter.lastConfigReport = null;
+            const result = dispatch({ action: 'configApplyTier', tier });
+            if (!result.ok) {
+                actionMessage.value = result.error ?? '档位切换失败';
+                return;
+            }
+            pendingTier.value = tier;
+            actionMessage.value = `正在切换到${TIER_LABEL[tier]}档并检查当前浏览器能力…`;
         };
+        watch(() => store.configVersionCount, () => {
+            if (!pendingTier.value)
+                return;
+            const last = report();
+            if (!last)
+                return;
+            actionMessage.value = last?.ok
+                ? `已切换到${TIER_LABEL[pendingTier.value]}档，并保存到酒馆设置。`
+                : `切换失败：${last?.error ?? '未知错误'}`;
+            pendingTier.value = null;
+        });
         const rollback = () => {
             const result = dispatch({ action: 'configRollback' });
             actionMessage.value = result.ok ? '已提交快照回滚。' : result.error ?? '回滚失败';
@@ -23809,14 +23967,29 @@ const ConfigView = defineComponent({
             const last = report();
             const snap = snapshot();
             return h('div', { class: 'nlk-section' }, [
-                h('div', { class: 'nlk-h3' }, `玩家配置（当前：${TIER_LABEL[current.tier] ?? current.tier} / 存储 ${current.storage} / 检索 ${current.retrieval}）`),
-                h('div', { class: 'nlk-row' }, [
+                h('section', { class: 'nlk-page-head' }, [h('div', { class: 'nlk-eyebrow' }, '运行设置'), h('h2', null, '选择适合这张卡的运行方式'), h('p', null, '档位会调整记忆保存与检索能力，不会改变你已经定义的变量。点击后自动保存。')]),
+                h('div', { class: 'nlk-tier-grid' }, [
                     ['minimal', 'standard', 'advanced'].map((tier) => h('button', {
                         key: tier,
-                        class: current.tier === tier ? 'nlk-btn nlk-active' : 'nlk-btn',
+                        class: current.tier === tier ? 'nlk-tier-card nlk-tier-active' : 'nlk-tier-card',
                         onClick: () => applyTier(tier),
-                    }, tier === 'minimal' ? '极简档（零配置直用）' : tier === 'standard' ? '标准档' : '进阶档（向量）')),
+                        disabled: pendingTier.value !== null,
+                    }, [
+                        h('span', { class: 'nlk-tier-icon' }, tier === 'minimal' ? '◇' : tier === 'standard' ? '◈' : '✦'),
+                        h('strong', null, tier === 'minimal' ? '极简' : tier === 'standard' ? '标准' : '进阶'),
+                        h('small', null, tier === 'minimal' ? '纯浏览器基础能力，最省心' : tier === 'standard' ? '更可靠的本地保存，推荐大多数卡' : '在可用时启用本地向量检索'),
+                        h('em', null, current.tier === tier ? '当前使用' : '点击切换'),
+                    ])),
                 ]),
+                h('article', { class: 'nlk-info-card' }, [
+                    h('div', { class: 'nlk-info-icon' }, '⇄'),
+                    h('div', null, [h('strong', null, '变量 Agent 用哪个 API？'), h('p', null, '直接使用酒馆当前“API 连接”中选定的模型和密钥，NLKaleido 不会再保存一份 Key。前端变量 API 也不需要网址或密钥；权限在作者页“前端 API”中逐变量开启。')]),
+                ]),
+                h('article', { class: 'nlk-info-card' }, [
+                    h('div', { class: 'nlk-info-icon' }, '◐'),
+                    h('div', null, [h('strong', null, '界面风格'), h('p', null, '只改变万花筒工作台的外观，不影响酒馆主题和角色卡。'), themePicker(store)]),
+                ]),
+                h('div', { class: 'nlk-h3' }, `当前能力：${TIER_LABEL[current.tier] ?? current.tier}档 · ${current.storage === 'memory' ? '临时内存' : current.storage === 'indexeddb' ? '浏览器数据库' : '酒馆设置'} · ${current.retrieval === 'bm25' ? '关键词检索' : '向量检索'}`),
                 h('div', { class: 'nlk-row' }, [
                     h('button', { class: 'nlk-btn', onClick: rollback, disabled: !snap }, '一键回滚快照'),
                     h('button', { class: confirmReset.value ? 'nlk-btn nlk-danger' : 'nlk-btn', onClick: factoryReset }, confirmReset.value ? '确认恢复' : '恢复出厂设置'),
@@ -23838,12 +24011,27 @@ const ConfigView = defineComponent({
                             check.fixAction ? h('span', { class: 'nlk-hint' }, `（修复：${check.fixAction}）`) : null,
                         ])),
                     ])
-                    : h('div', { class: 'nlk-hint' }, '切换档位后显示探测降级与连通性自检结果。'),
-                h('div', { class: 'nlk-hint' }, '资源上限保护：向量维度 ≤4096 / 记忆 ≤5000 条 / L3 预算 ≤4000 tokens / 注入 ≤10 条（防一键打爆）。'),
+                    : h('div', { class: 'nlk-hint' }, '切换档位后，这里会说明浏览器实际启用了哪些能力。'),
+                h('div', { class: 'nlk-hint' }, '系统会自动限制记忆数量和注入长度，避免单次配置消耗过多资源。'),
             ]);
         };
     },
 });
+const THEME_OPTIONS = [
+    { key: 'midnight', icon: '◐', label: '深色' },
+    { key: 'light', icon: '○', label: '亮色' },
+    { key: 'parchment', icon: '▧', label: '纸张' },
+    { key: 'system', icon: '◒', label: '跟随酒馆' },
+];
+function themePicker(store, compact = false) {
+    return h('div', { class: compact ? 'nlk-theme-picker nlk-theme-picker-compact' : 'nlk-theme-picker', 'aria-label': '界面风格' }, THEME_OPTIONS.map((item) => h('button', {
+        type: 'button',
+        title: item.label,
+        'aria-label': `切换为${item.label}风格`,
+        class: store.theme === item.key ? 'nlk-theme-choice nlk-theme-choice-active' : 'nlk-theme-choice',
+        onClick: () => store.setTheme(item.key),
+    }, compact ? item.icon : `${item.icon} ${item.label}`)));
+}
 /** 首屏身份分流：玩家直接看状态，作者进入配置向导。 */
 const RoleChooser = defineComponent({
     name: 'NlRoleChooser',
@@ -23860,6 +24048,7 @@ const RoleChooser = defineComponent({
                 h('div', { class: 'nlk-eyebrow' }, '欢迎使用万花筒'),
                 h('h1', null, '你准备以什么身份进入？'),
                 h('p', null, '玩家只看到角色和世界状态；作者负责定义要追踪的变量、更新方式与可选功能。之后可随时切换。'),
+                themePicker(store),
             ]),
             h('div', { class: 'nlk-role-grid' }, [
                 h('button', { class: 'nlk-role-card nlk-role-player', onClick: () => choose('player') }, [
@@ -23901,24 +24090,52 @@ const PanelRoot = defineComponent({
                             : store.activeTab === 'config'
                                 ? h(ConfigView)
                                 : h(PlayerView);
-        return () => store.roleMode === 'choose' ? h(RoleChooser) : h('div', { class: 'nlk-root' }, [
-            h('aside', { class: 'nlk-sidebar' }, [
-                h('div', { class: 'nlk-brand' }, [h('span', { class: 'nlk-brand-mark' }, '◇'), h('div', null, [h('strong', null, '万花筒'), h('small', null, 'NLKaleido')])]),
-                h('div', { class: 'nlk-role-current' }, [h('span', null, store.roleMode === 'author' ? '✦ 作者模式' : '⌂ 玩家模式'), h('button', { onClick: () => { store.roleMode = 'choose'; } }, '切换')]),
-                store.roleMode === 'player'
-                    ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '我的游戏'), tab('player', '⌂', '角色状态'), tab('memory', '◉', '故事记忆'), tab('plot', '⌁', '世界进展'), tab('dice', '⬡', '掷骰与检定')])
-                    : h('div', { class: 'nlk-nav-group' }, [h('small', null, '创作流程'), tab('author', '✦', '变量与规则'), tab('player', '◫', '玩家页面预览')]),
-                store.roleMode === 'author' ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '作者工具'), tab('memory', '◉', '记忆数据'), tab('plot', '⌁', '世界推演'), tab('dice', '⬡', '检定测试'), tab('config', '⚙', '运行设置'), tab('migration', '⇄', '导入 MVU 老卡')]) : null,
-                h('div', { class: 'nlk-sidebar-foot' }, [h('span', { class: 'nlk-health-dot' }), `轮次 ${store.lastTurnId} · ${store.pending.length} 待复核`]),
-            ]),
-            h('main', { class: 'nlk-main' }, [
-                store.runtimeMessage ? h('div', { class: 'nlk-toast nlk-toast-error' }, [h('span', null, store.runtimeMessage), h('button', { class: 'nlk-icon-btn', onClick: () => { store.runtimeMessage = ''; } }, '×')]) : null,
-                page(),
-            ]),
-        ]);
+        return () => h('div', { class: `nlk-shell nlk-theme-${store.theme}` }, [store.roleMode === 'choose' ? h(RoleChooser) : h('div', { class: 'nlk-root' }, [
+                h('aside', { class: 'nlk-sidebar' }, [
+                    h('div', { class: 'nlk-brand' }, [h('span', { class: 'nlk-brand-mark' }, '◇'), h('div', null, [h('strong', null, '万花筒'), h('small', null, 'NLKaleido')])]),
+                    h('div', { class: 'nlk-role-current' }, [h('span', null, store.roleMode === 'author' ? '✦ 作者模式' : '⌂ 玩家模式'), h('button', { onClick: () => { store.roleMode = 'choose'; } }, '切换')]),
+                    themePicker(store, true),
+                    store.roleMode === 'player'
+                        ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '我的游戏'), tab('player', '⌂', '角色状态'), tab('memory', '◉', '故事记忆'), tab('plot', '⌁', '世界进展'), tab('dice', '⬡', '掷骰与检定')])
+                        : h('div', { class: 'nlk-nav-group' }, [h('small', null, '创作流程'), tab('author', '✦', '变量与规则'), tab('player', '◫', '玩家页面预览')]),
+                    store.roleMode === 'author' ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '作者工具'), tab('memory', '◉', '记忆数据'), tab('plot', '⌁', '世界推演'), tab('dice', '⬡', '检定测试'), tab('config', '⚙', '运行设置'), tab('migration', '⇄', '导入 MVU 老卡')]) : null,
+                    h('div', { class: 'nlk-sidebar-foot' }, [h('span', { class: 'nlk-health-dot' }), `轮次 ${store.lastTurnId} · ${store.pending.length} 待复核`]),
+                ]),
+                h('main', { class: 'nlk-main' }, [
+                    store.runtimeMessage ? h('div', { class: 'nlk-toast nlk-toast-error' }, [h('span', null, store.runtimeMessage), h('button', { class: 'nlk-icon-btn', onClick: () => { store.runtimeMessage = ''; } }, '×')]) : null,
+                    page(),
+                ]),
+            ])]);
     },
 });
 const CSS = `
+.nlk-shell {
+  --nlk-bg: #17171d; --nlk-surface: rgba(255,255,255,.035); --nlk-surface-strong: #202027;
+  --nlk-sidebar-bg: rgba(8,9,14,.42); --nlk-text: #e8e8ee; --nlk-muted: rgba(232,232,238,.52);
+  --nlk-title: #fff; --nlk-border: rgba(255,255,255,.09); --nlk-input-bg: rgba(0,0,0,.22);
+  --nlk-accent: #8d72ef; --nlk-accent-soft: rgba(126,92,255,.16); --nlk-code: #bcf2dc;
+  min-height: 100%; color: var(--nlk-text); background: var(--nlk-bg);
+}
+.nlk-theme-light {
+  --nlk-bg: #f4f6fb; --nlk-surface: #fff; --nlk-surface-strong: #fff;
+  --nlk-sidebar-bg: #e9edf7; --nlk-text: #263044; --nlk-muted: #69748a; --nlk-title: #172033;
+  --nlk-border: rgba(48,63,91,.14); --nlk-input-bg: #f8f9fc; --nlk-accent: #6750c7;
+  --nlk-accent-soft: rgba(103,80,199,.11); --nlk-code: #17694f;
+}
+.nlk-theme-parchment {
+  --nlk-bg: #eee5d2; --nlk-surface: rgba(255,252,242,.74); --nlk-surface-strong: #f8f0df;
+  --nlk-sidebar-bg: #dfd0b4; --nlk-text: #40372d; --nlk-muted: #766a5b; --nlk-title: #2f281f;
+  --nlk-border: rgba(91,70,44,.19); --nlk-input-bg: rgba(255,252,244,.72); --nlk-accent: #8b552f;
+  --nlk-accent-soft: rgba(139,85,47,.12); --nlk-code: #285f49;
+}
+.nlk-theme-system {
+  --nlk-bg: var(--SmartThemeBlurTintColor, #202027); --nlk-surface: var(--black10a, rgba(255,255,255,.035));
+  --nlk-surface-strong: var(--SmartThemeBlurTintColor, #202027); --nlk-sidebar-bg: var(--black30a, rgba(8,9,14,.42));
+  --nlk-text: var(--SmartThemeBodyColor, #e8e8ee); --nlk-muted: var(--white50a, rgba(232,232,238,.52));
+  --nlk-title: var(--SmartThemeBodyColor, #fff); --nlk-border: var(--SmartThemeBorderColor, rgba(255,255,255,.12));
+  --nlk-input-bg: var(--black30a, rgba(0,0,0,.22)); --nlk-accent: var(--SmartThemeQuoteColor, #8d72ef);
+  --nlk-accent-soft: rgba(126,92,255,.16); --nlk-code: #bcf2dc;
+}
 .nlk-root { font-size: 13px; color: var(--white70a, #ccc); line-height: 1.5; }
 .nlk-section { margin-bottom: 8px; }
 .nlk-statusbar { display: flex; gap: 10px; align-items: center; padding: 6px 8px; background: var(--black30a, rgba(0,0,0,.3)); border-radius: 6px; }
@@ -24052,6 +24269,73 @@ const CSS = `
 .nlk-toast { margin-bottom: 10px; padding: 9px 11px; border-radius: 8px; } .nlk-toast-ok { color: #8be5b6; background: rgba(68,185,125,.11); } .nlk-toast-error { color: #ff9ba5; background: rgba(220,72,91,.11); } .nlk-toast-info { color: #b8caff; background: rgba(82,118,210,.11); }
 .nlk-technical { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 10px; } .nlk-technical > summary { cursor: pointer; opacity: .65; }
 .nlkaleido-mount-error { padding: 16px; color: var(--red, #f66); white-space: pre-wrap; }
+.nlk-shell, .nlk-root, .nlk-role-gate { color: var(--nlk-text); background-color: var(--nlk-bg); }
+.nlk-role-gate { background-image: radial-gradient(circle at 50% 10%, var(--nlk-accent-soft), transparent 44%); }
+.nlk-role-intro h1, .nlk-role-card strong, .nlk-dashboard-hero h2, .nlk-author-hero h2, .nlk-card-title, .nlk-pane-title, .nlk-kpi strong, .nlk-h3 { color: var(--nlk-title); }
+.nlk-role-intro p, .nlk-role-card span, .nlk-dashboard-hero p, .nlk-author-hero p, .nlk-hint, .nlk-help { color: var(--nlk-muted); opacity: 1; }
+.nlk-role-card, .nlk-kpi, .nlk-status-card, .nlk-card, .nlk-author-grid, .nlk-system-card, .nlk-check-explain, .nlk-sidebar-foot, .nlk-technical { border-color: var(--nlk-border); background: var(--nlk-surface); }
+.nlk-role-card:hover { border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-role-card .nlk-role-icon, .nlk-field-item-active, .nlk-nav-active { color: var(--nlk-accent); background: var(--nlk-accent-soft) !important; }
+.nlk-sidebar { color: var(--nlk-text); border-color: var(--nlk-border); background: var(--nlk-sidebar-bg); }
+.nlk-main, .nlk-editor-pane { background: var(--nlk-bg); }
+.nlk-field-list { border-color: var(--nlk-border); background: color-mix(in srgb, var(--nlk-sidebar-bg) 65%, transparent); }
+.nlk-nav-item:hover, .nlk-field-item:hover { background: var(--nlk-surface); }
+.nlk-input, .nlk-code-editor, .nlk-contract-input, .nlk-pre { color: var(--nlk-text); border-color: var(--nlk-border); background: var(--nlk-input-bg); }
+.nlk-label, .nlk-status-row strong { color: var(--nlk-title); }
+.nlk-subnavs { background: var(--nlk-input-bg); }
+.nlk-subnav-active { color: var(--nlk-title); background: var(--nlk-surface-strong); }
+.nlk-btn { color: var(--nlk-text); border-color: var(--nlk-border); background: var(--nlk-surface); }
+.nlk-btn:hover { border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-btn-primary { color: #fff; border-color: var(--nlk-accent); background: linear-gradient(135deg,var(--nlk-accent),color-mix(in srgb,var(--nlk-accent) 64%,#147fa3)); }
+.nlk-callout { color: var(--nlk-text); border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-page-head { margin: 0 0 18px; }
+.nlk-page-head h2 { margin: 3px 0 5px; color: var(--nlk-title); font-size: 23px; }
+.nlk-page-head p { margin: 0; color: var(--nlk-muted); }
+.nlk-theme-picker { display: flex; justify-content: center; gap: 7px; margin-top: 16px; flex-wrap: wrap; }
+.nlk-theme-choice { min-height: 32px; padding: 5px 11px; color: var(--nlk-muted); border: 1px solid var(--nlk-border); border-radius: 99px; background: var(--nlk-surface); cursor: pointer; }
+.nlk-theme-choice:hover { color: var(--nlk-title); border-color: var(--nlk-accent); }
+.nlk-theme-choice-active { color: var(--nlk-title); border-color: var(--nlk-accent); background: var(--nlk-accent-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb,var(--nlk-accent) 25%,transparent); }
+.nlk-theme-picker-compact { justify-content: flex-start; gap: 3px; margin: 0; padding: 0 7px; }
+.nlk-theme-picker-compact .nlk-theme-choice { min-width: 25px; min-height: 25px; padding: 2px; }
+.nlk-tier-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 11px; margin: 15px 0; }
+.nlk-tier-card { position: relative; min-height: 160px; padding: 17px; display: flex; flex-direction: column; align-items: flex-start; text-align: left; color: var(--nlk-text); border: 1px solid var(--nlk-border); border-radius: 14px; background: var(--nlk-surface); cursor: pointer; transition: transform .15s ease,border-color .15s ease,background .15s ease; }
+.nlk-tier-card:hover:not(:disabled) { transform: translateY(-2px); border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-tier-card:disabled { cursor: wait; opacity: .65; }
+.nlk-tier-card strong { margin-top: 10px; color: var(--nlk-title); font-size: 17px; }
+.nlk-tier-card small { margin-top: 5px; color: var(--nlk-muted); line-height: 1.5; }
+.nlk-tier-card em { margin-top: auto; color: var(--nlk-muted); font-size: 10px; font-style: normal; font-weight: 700; }
+.nlk-tier-icon { width: 34px; height: 34px; display: grid; place-items: center; color: var(--nlk-accent); border-radius: 10px; background: var(--nlk-accent-soft); font-size: 18px; }
+.nlk-tier-active { border-color: var(--nlk-accent); background: var(--nlk-accent-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb,var(--nlk-accent) 24%,transparent); }
+.nlk-tier-active em { color: var(--nlk-accent); }
+.nlk-info-card { margin: 10px 0; padding: 13px 15px; display: flex; align-items: flex-start; gap: 12px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
+.nlk-info-card p, .nlk-api-overview p { margin: 3px 0 0; color: var(--nlk-muted); }
+.nlk-info-icon { flex: 0 0 auto; min-width: 32px; height: 32px; padding: 0 5px; display: grid; place-items: center; color: var(--nlk-accent); border-radius: 9px; background: var(--nlk-accent-soft); font: 700 12px/1 ui-monospace,monospace; }
+.nlk-info-card .nlk-theme-picker { justify-content: flex-start; margin-top: 9px; }
+.nlk-form-span { grid-column: 1 / -1; }
+.nlk-value-builder { min-width: 0; }
+.nlk-builder-list { display: flex; flex-direction: column; gap: 7px; margin: 7px 0; }
+.nlk-builder-row { display: grid; grid-template-columns: 25px minmax(0,1fr) 27px; gap: 7px; align-items: center; }
+.nlk-builder-pair { grid-template-columns: minmax(100px,.8fr) 18px minmax(120px,1.2fr) 27px; }
+.nlk-builder-index { width: 24px; height: 24px; display: grid; place-items: center; color: var(--nlk-muted); border-radius: 7px; background: var(--nlk-surface); font-size: 10px; }
+.nlk-builder-arrow { color: var(--nlk-muted); text-align: center; }
+.nlk-segmented { width: 100%; display: grid; grid-template-columns: repeat(2,1fr); gap: 3px; margin-top: 7px; padding: 3px; border-radius: 9px; background: var(--nlk-input-bg); }
+.nlk-segmented button { min-height: 31px; color: var(--nlk-muted); border: 0; border-radius: 7px; background: transparent; cursor: pointer; }
+.nlk-segmented .nlk-segmented-active { color: #fff; background: var(--nlk-accent); }
+.nlk-check-important { border-color: color-mix(in srgb,var(--nlk-accent) 48%,var(--nlk-border)); background: var(--nlk-accent-soft); }
+.nlk-api-overview { padding: 17px; display: grid; grid-template-columns: auto minmax(0,1fr); gap: 13px; border: 1px solid var(--nlk-border); border-radius: 13px; background: var(--nlk-surface); }
+.nlk-api-overview code { margin-top: 12px; padding: 11px 12px; display: block; overflow-x: auto; white-space: pre; color: var(--nlk-code); border-radius: 8px; background: var(--nlk-input-bg); font: 11px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.nlk-api-field-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(245px,1fr)); gap: 9px; }
+.nlk-api-field { padding: 12px 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--nlk-border); border-radius: 10px; background: var(--nlk-surface); }
+.nlk-api-field strong, .nlk-api-field small { display: block; overflow-wrap: anywhere; }
+.nlk-api-field small { color: var(--nlk-muted); }
+.nlk-api-field-on { border-color: color-mix(in srgb,var(--nlk-accent) 42%,var(--nlk-border)); background: var(--nlk-accent-soft); }
+.nlk-switch-line { flex: 0 0 auto; display: flex; align-items: center; gap: 7px; color: var(--nlk-muted); font-size: 10px; cursor: pointer; }
+.nlk-switch-line input { width: 17px; height: 17px; accent-color: var(--nlk-accent); }
+.nlk-api-card { border-color: color-mix(in srgb,var(--nlk-code) 28%,var(--nlk-border)); background: color-mix(in srgb,var(--nlk-code) 6%,var(--nlk-surface)); }
+.nlk-api-card code { color: var(--nlk-code); background: var(--nlk-input-bg); }
+.nlk-feature-empty { min-height: 430px; padding: 28px; display: grid; place-content: center; justify-items: center; text-align: center; }
+.nlk-feature-empty h2 { margin: 10px 0 3px; color: var(--nlk-title); }
+.nlk-feature-empty p { max-width: 430px; margin: 0 0 16px; color: var(--nlk-muted); }
 @media (max-width: 700px) {
   .nlkaleido-float-status { top: calc(100dvh - 48px); right: 8px; bottom: auto; }
   .nlkaleido-workbench { padding: 0; }
@@ -24065,7 +24349,12 @@ const CSS = `
   .nlk-sidebar { position: sticky; z-index: 2; top: 0; min-height: 0; height: auto; padding: 7px; flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.1); }
   .nlk-brand, .nlk-nav-group > small, .nlk-sidebar-foot { display: none; } .nlk-role-current { flex: 0 0 auto; } .nlk-nav-group { display: contents; } .nlk-nav-item { width: auto; flex: 0 0 auto; } .nlk-nav-active { box-shadow: inset 0 -2px #9f83ff; }
   .nlk-main { padding: 15px 12px 32px; } .nlk-kpis { grid-template-columns: repeat(2,1fr); } .nlk-author-grid { display: block; } .nlk-field-list { border-right: 0; border-bottom: 1px solid rgba(255,255,255,.08); max-height: 210px; overflow:auto; } .nlk-form-grid { grid-template-columns: 1fr; }
-  .nlk-ai-draft, .nlk-api-card { grid-template-columns: 1fr; } .nlk-author-hero, .nlk-dashboard-hero { align-items: flex-start; flex-direction: column; } .nlk-save-area { width: 100%; flex-wrap: wrap; }
+  .nlk-ai-draft, .nlk-api-card, .nlk-api-overview { grid-template-columns: 1fr; } .nlk-author-hero, .nlk-dashboard-hero { align-items: flex-start; flex-direction: column; } .nlk-save-area { width: 100%; flex-wrap: wrap; }
+  .nlk-tier-grid { grid-template-columns: 1fr; }
+  .nlk-tier-card { min-height: 125px; }
+  .nlk-builder-pair { grid-template-columns: 1fr 18px 1fr 27px; }
+  .nlk-subnavs { width: 100%; overflow-x: auto; }
+  .nlk-subnav { flex: 0 0 auto; }
 }
 `;
 /**
@@ -24076,6 +24365,7 @@ const CSS = `
  * 扩展异步加载或移动端布局下，用户仍然一定能从右下角按钮打开完整界面。
  */
 function mountPanel(deps) {
+    mountedBridge = deps.bridge;
     if (mountedPanel) {
         mountedPanel.refresh();
         return mountedPanel;
@@ -24308,7 +24598,7 @@ let adapter = null;
 let startupState = 'idle';
 let startupError = null;
 let previousChatId = null;
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 /** 稳定 API 入口（每次取新鲜引用：chatMetadata 在切聊天后引用会变，文档警告不可长持） */
 function getStContext() {
     const globalObject = globalThis;
@@ -24576,14 +24866,14 @@ function bootstrapState(contract) {
 /** L0 任务模板（变量 Agent 系统提示，§5.1：全社区统一、字节恒定；作者可经注册表覆盖） */
 const L0_TEMPLATE = [
     '你是变量状态维护 Agent。根据最近剧情与用户输入，维护契约声明的变量状态。',
-    '规则：',
-    '1. 只修改本轮到期（due）或与你判断相关且你有权写入的字段；',
-    '2. 输出严格 JSON：{"analysis":"...","json_patch":[{"op":"replace|delta|add|remove|move","path":"...","value":...,"confidence":"high|medium|low","rationale":"..."}]}；',
-    '3. delta 只用于数值字段；replace 必须类型一致；不确定的更新给 low 置信度或省略；',
-    '4. <STABLE_BATCH> 引用的静态字段值在契约层维护：禁止凭对话上下文推断、改写或猜测；',
-    '5. 禁止把 <STABLE_BATCH> 标签复制到自己输出里；禁止给标签内任一字段「补一个新值」；',
-    '6. 只对真正改变的字段输出 op；稳定（stable）与冻结（frozen）字段保持沉默；',
-    '7. 不输出 JSON 之外的任何内容。',
+    '以下要求是强制协议，不是建议：',
+    '1. 必须逐项审查“本轮必须逐项审查的变量”，每项都写入 reviewed；不得因变化不明显、工作量大或想提前结束而跳过。',
+    '2. 一旦剧情证据满足字段更新规则，必须输出对应 json_patch；禁止明明满足条件却以“保持稳定”为由不更新。',
+    '3. 如果确实没有满足条件，也必须在 reviewed 中标记 unchanged，并给出基于剧情证据的具体理由；空泛的“无变化”不合格。',
+    '4. 输出严格 JSON：{"analysis":"...","reviewed":[{"path":"...","decision":"update|unchanged","rationale":"..."}],"json_patch":[{"op":"replace|delta|add|remove|move","path":"...","value":...,"confidence":"high|medium|low","rationale":"..."}]}。',
+    '5. 只修改到期或相关且有写入权限的字段；delta 只用于数字，replace 必须类型一致；不确定的真实变化使用 low 置信度，不得直接略过必审项。',
+    '6. <STABLE_BATCH> 引用的静态字段值由契约维护：禁止猜测、改写、补值或把标签复制到输出。',
+    '7. json_patch 只放真正改变的字段；reviewed 必须覆盖所有必审字段；不输出 JSON 之外的内容。',
 ].join('\n');
 // ============================================================
 // 触发：APP_READY 在 ST 1.17.0 的 EventEmitter 中支持 late-listener auto-fire。
