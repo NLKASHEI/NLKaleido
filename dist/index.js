@@ -1,27 +1,31 @@
 /**
- * hash64 —— 64 位双通道混合哈希（§7 G2，按《压缩相邻消息_绿灯缓存算法还原.md》§3.2 原文还原）。
- * 0x9E3779B1 / 0x5F356495 乘法通道 + 0x85ebca6b / 0xc2b2ae35 交叉雪崩（Murmur 风格）；
- * 输出 `${h2}${h1}` 各 8 位十六进制共 16 位。快于 sha256，适合消息/内容高频指纹。
+ * hash64 —— 64 位双通道混合哈希（§7 G2）。
+ * 算法以《研究代码.txt》第 4 行原文 `q()` 为准（2026-08-14 直接核对）：
+ * - 双种子：0xDEADBEEF ^ len（t）、0x41C6CE57 ^ len（n）——原文十进制 1103547991；
+ *   ⚠️ 还原文档写 0x41C64E6D 系转写错误，已按原文改正；
+ * - 循环：imul(t ^ ch, 0x9E3779B1) / imul(n ^ ch, 0x5F356495)（32 位乘法）；
+ * - 雪崩：0x85EBCA6B / 0xC2B2AE35 交叉混合（t 先更新，n 用新 t）；
+ * - 输出 `${n}${t}` 各 8 位 hex（16 位）。
+ * 黄金向量（原文 q() 实测）：'' → 488bdcb81aee8d83；'abc' → 9bd099588f6f1534（单测锁定）。
  * 纯 TS、同步、无 crypto 依赖（浏览器端可用）。
  *
  * 【实现决策】KaleidoState.revision.hash（§7 声明 sha256）在浏览器同步路径下改走 hash64；
  * 需要密码学强度时（P2 checkpoint 校验）由存储层用 Web Crypto `crypto.subtle.digest('SHA-256')`
  * （异步）另行计算。
  */
-/** 64 位双通道混合哈希（原文算法，逐字符 32 位乘法 + 交叉雪崩） */
+/** 64 位双通道混合哈希（研究代码.txt 行 4 原文 q() 逐位复刻） */
 function hash64(text) {
     const input = String(text ?? '');
-    let h1 = (0xdeadbeef ^ input.length) >>> 0;
-    let h2 = (0x41c64e6d ^ input.length) >>> 0;
+    let t = (0xdeadbeef ^ input.length) >>> 0;
+    let n = (0x41c6ce57 ^ input.length) >>> 0;
     for (let i = 0; i < input.length; i += 1) {
         const code = input.charCodeAt(i);
-        h1 = Math.imul(h1 ^ code, 0x9e3779b1) >>> 0;
-        h2 = Math.imul(h2 ^ code, 0x5f356495) >>> 0;
+        t = Math.imul(t ^ code, 0x9e3779b1);
+        n = Math.imul(n ^ code, 0x5f356495);
     }
-    // 雪崩混合（MurmurHash 风格，两通道交叉）
-    h1 = (Math.imul(h1 ^ (h1 >>> 16), 0x85ebca6b) ^ Math.imul(h2 ^ (h2 >>> 13), 0xc2b2ae35)) >>> 0;
-    h2 = (Math.imul(h2 ^ (h2 >>> 16), 0x85ebca6b) ^ Math.imul(h1 ^ (h1 >>> 13), 0xc2b2ae35)) >>> 0;
-    return `${h2.toString(16).padStart(8, '0')}${h1.toString(16).padStart(8, '0')}`;
+    t = (Math.imul(t ^ (t >>> 16), 0x85ebca6b) ^ Math.imul(n ^ (n >>> 13), 0xc2b2ae35)) >>> 0;
+    n = (Math.imul(n ^ (n >>> 16), 0x85ebca6b) ^ Math.imul(t ^ (t >>> 13), 0xc2b2ae35)) >>> 0;
+    return `${n.toString(16).padStart(8, '0')}${t.toString(16).padStart(8, '0')}`;
 }
 
 const VALID_OPS = new Set(['replace', 'delta', 'add', 'remove', 'move']);
