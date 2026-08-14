@@ -14,11 +14,9 @@
 
 ## 使用
 
-- **玩家模式（默认）**：聊天正文生成结束后自动触发变量更新；面板状态板显示当前变量与待复核数量，开箱即用（需先在作者模式配置契约）。
-- **作者模式**：面板左上角切「作者」→
-  - **契约编辑器**：粘贴/编辑契约 JSON（字段 + 更新规则 + 护栏），保存即校验生效；
-  - **预览**：状态表（full/summary/incremental）与观察层预览（Agent 本轮可见字段）；
-  - **调试**：changelog diff / 单条回滚 / pending 接受或丢弃；
+- **首次进入**：先选择“我是玩家”或“我是作者”，之后可随时切换。
+- **玩家模式**：直接显示当前角色与世界状态，不暴露作者设置。
+- **作者模式**：使用带用途说明的向导定义变量、AI 更新方式、玩家显示和前端写入权限；复杂 JSON、变量预览与审计工具收在高级区。
   - **导出**：一键下载 `{contract, stat_data, changelog}` 打包 JSON。
 - **记忆（M13）**：契约声明 `memory: { enabled: true }` → 反思写入（同一变量请求）+ BM25 检索 + L3 记忆段注入 + 遗忘状态机 + 记忆表（面板「记忆」页签浏览/手动归档/检索）。
 - **剧情（M15）**：契约声明 `plot: { enabled: true }` → 事件链状态机（本地骰子 + API 双驱）+ 风声系统 + 区域事件（面板「剧情」页签手动推进/停滞/终局）。
@@ -54,9 +52,22 @@
 }
 ```
 
-## 运行时 API（作者扩展）
+## 角色卡前端变量 API
 
-`window.NLKaleido` 暴露：`getState()` / `getContract()` / `dispatch({action, ...})`。
+每个变量须由作者单独开启“允许前端脚本写入”。正式 API 会检查声明、类型、权限和跨变量约束，
+并且 `await` 返回时已经完成派生计算、审计和保存：
+
+```js
+const value = NLKaleido.variables.get('角色.好感度');
+const result = await NLKaleido.variables.set('角色.好感度', 80);
+await NLKaleido.variables.setMany({ '角色.好感度': 80, '世界.阶段': '第一章' });
+const declared = NLKaleido.variables.list();
+const unsubscribe = NLKaleido.variables.subscribe((variables) => render(variables));
+```
+
+并发写入按调用顺序串行保存；保存失败会拒绝 Promise 并恢复内存状态。底层
+`getState()` / `getContract()` / `dispatch()` 仅为内置管理界面和兼容用途保留。
+
 事件（经 ST eventSource）：`nlkaleido:status_changed` / `nlkaleido:pending_updated` / `nlkaleido:contract_changed` / `nlkaleido:metrics` / `nlkaleido:run_changed` / `nlkaleido:achievement_unlocked` / `nlkaleido:memory_changed` / `nlkaleido:plot_changed` / `nlkaleido:dice_rolled` / `nlkaleido:config_changed`。
 
 ## 技术说明
@@ -73,7 +84,7 @@
 
 ```bash
 npm install
-npm test        # 394 测试
+npm test        # 429 测试
 npm run build   # tsc → rollup → release/dist/（index.js + chunks/）
 ```
 
