@@ -4633,6 +4633,10 @@ const plotConfigSchema = objectType({
 /** @since M16 检定系统配置（§23；默认关闭） */
 const diceConfigSchema = objectType({
     enabled: booleanType(),
+    system: enumType(['coc', 'dnd', 'custom']).optional(),
+    defaultFormula: stringType().min(1).optional(),
+    defaultTarget: numberType().finite().optional(),
+    resultHint: stringType().optional(),
 });
 const contractSchema = objectType({
     version: numberType().int().positive(),
@@ -5430,7 +5434,7 @@ function validateOps(c, state, ops, turnId, opts = {}) {
                 continue;
             }
             // 3. 所有权 writers 白名单（§4.7-1）
-            if (!isWriterAllowed(field, source)) {
+            if (opts.skipOwnership !== true && !isWriterAllowed(field, source)) {
                 rejected.push({ op, reason: `not_owner：写者 '${source}' 不在字段 ${op.path} 的 writers 白名单` });
                 continue;
             }
@@ -8345,6 +8349,37 @@ function detectVersion(globals) {
 }
 
 /**
+ * “AI 帮帮”专用创作 Skill。它不是泛化聊天提示，而是一套可审计的契约设计流程：
+ * 需求拆解 → 最小变量集 → 更新证据 → 可视化默认值 → 世界书联动 → 可选系统。
+ */
+function buildAuthorSkillPrompt(input) {
+    const lore = input.lorebooks.length
+        ? input.lorebooks.map((book) => `${book.name}：${book.entries.map((entry) => entry.name).join('、') || '（无条目）'}`).join('\n')
+        : '（当前角色没有可读取的世界书）';
+    return [
+        '# NLKaleido 作者协作 Skill v1',
+        '你的工作是把作者的一句话需求变成“少而够用、能直接检查”的完整契约草稿。只输出 JSON，不输出 Markdown 或解释。',
+        '',
+        '## 必须执行的设计步骤',
+        '1. 先识别玩家真正需要看到或被剧情逻辑使用的状态，删除纯装饰、重复和无法从剧情判断的变量。',
+        '2. 每个变量选择最直观类型与默认值：清单用 list，动态名称和值用 kv，固定属性集合用 object。',
+        '3. 每个可自动更新变量都要写具体 changeRule：什么剧情证据触发、怎样变化、哪些情况必须不变、数值边界。',
+        '4. reviewRequired 默认 true。除非作者明确要求后台隐藏，否则 display=true。',
+        '5. 只有下面“可用世界书条目”中真实存在的世界书和条目才能写入 ejs；不得编造名称。作者要求联动但没有匹配条目时，保留 ejs 为空，不要猜。',
+        '6. ejs 条件优先使用简单 var 比较，entryPlacement 必须是 l3_tail；一条规则只表达一个清晰条件。',
+        '7. 作者提到跨轮事实、幕后世界发展或检定时，分别启用 memory、plot、dice；没有提到则保持关闭，避免额外开销。',
+        '8. 必须保留完整 Contract 外形：version、id、schema、updateRules、displayRules、guardrails、invariants；不要加入脚本、eval、模板代码。',
+        '',
+        '## 可用世界书条目（只能从这里选择）',
+        lore,
+        '',
+        input.current ? `## 当前契约（在它上面修改，不要无故删掉作者已有设计）\n${JSON.stringify(input.current)}` : '## 当前契约\n（尚未配置）',
+        '',
+        `## 作者需求\n${input.request.trim()}`,
+    ].join('\n');
+}
+
+/**
  * KaleidoStAdapter（§10.2）：对接 ST 的适配层。
  *
  * - detectVersion（§10.2）：版本嗅探，兼容性退路（面板优雅降级不白屏）。
@@ -8364,9 +8399,11 @@ function detectVersion(globals) {
  */
 function minimalConfigFallback() {
     return {
-        configVersion: 1, tier: 'minimal', storage: 'memory', retrieval: 'bm25',
+        configVersion: 2, tier: 'minimal', storage: 'memory', retrieval: 'bm25',
         memory: { maxAtoms: 300, injectTopK: 5, archiveThreshold: 50, archiveBatchSize: 3 },
         resources: { maxVectorDims: 1024, maxMemoryTokens: 800 },
+        primaryAi: { mode: 'sillytavern', baseUrl: '', apiKey: '', model: '', timeoutMs: 60_000 },
+        embeddingApi: { enabled: false, baseUrl: '', apiKey: '', model: '', dimensions: 1024 },
     };
 }
 /** 变量请求隐藏标记（§10.2 事件隔离）：SETTINGS_READY 只重排含此标记的请求 */
@@ -8452,6 +8489,8 @@ class KaleidoStAdapter {
     configModule = null;
     configModulePromise = null;
     providerProbeRunning = false;
+    /** 外部向量只缓存记忆正文；query 每次重算，正文变化时 hash 自动换键。 */
+    embeddingCache = new Map();
     constructor(globals, options = {}) {
         this.globals = globals;
         this.options = options;
@@ -8474,9 +8513,242 @@ class KaleidoStAdapter {
     async ensureConfigModule() {
         if (this.configModule)
             return this.configModule;
-        this.configModulePromise ??= import('./chunks/config-CnkAfSzR.js');
+        this.configModulePromise ??= import('./chunks/config-De8EIrIy.js');
         this.configModule = await this.configModulePromise;
         return this.configModule;
+    }
+    endpointUrl(baseUrl, resource) {
+        const trimmed = baseUrl.trim().replace(/\/+$/, '');
+        if (!trimmed)
+            throw new Error('请填写 API URL');
+        if (trimmed.endsWith(`/${resource}`))
+            return trimmed;
+        return `${trimmed}/${resource}`;
+    }
+    /**
+     * NLKaleido 内部所有文本 AI 请求的统一出口。默认复用酒馆连接；作者配置独立
+     * OpenAI-compatible URL 后，变量、世界推演、记忆归档和 AI 帮帮全部走该端点。
+     */
+    async generateAiData(prompt, options = {}) {
+        const ai = this.adapter.config.primaryAi;
+        if (ai.mode !== 'custom') {
+            const generateRawData = this.globals.getContext().generateRawData;
+            if (typeof generateRawData !== 'function')
+                throw new Error('酒馆当前没有可用的 API 连接');
+            return await generateRawData({ prompt, api: 'openai', ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}) }, undefined);
+        }
+        if (!ai.model.trim())
+            throw new Error('请填写主 AI 模型名称');
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.max(5_000, ai.timeoutMs || 60_000));
+        try {
+            const body = {
+                model: ai.model.trim(),
+                messages: prompt.filter((message) => message.name !== VREQ_MARKER).map(({ role, content }) => ({ role, content })),
+                stream: false,
+            };
+            if (options.maxTokens)
+                body.max_tokens = options.maxTokens;
+            const schemaDoc = options.jsonSchema;
+            if (schemaDoc) {
+                const schema = schemaDoc.value && typeof schemaDoc.value === 'object' ? schemaDoc.value : schemaDoc;
+                body.response_format = {
+                    type: 'json_schema',
+                    json_schema: { name: schemaDoc.name ?? 'nlkaleido_output', schema, strict: false },
+                };
+            }
+            const response = await fetch(this.endpointUrl(ai.baseUrl, 'chat/completions'), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(ai.apiKey.trim() ? { Authorization: `Bearer ${ai.apiKey.trim()}` } : {}),
+                },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            });
+            if (!response.ok) {
+                const detail = (await response.text()).slice(0, 500);
+                throw new Error(`主 AI 请求失败（HTTP ${response.status}）：${detail || response.statusText}`);
+            }
+            return await response.json();
+        }
+        catch (error) {
+            if (error instanceof DOMException && error.name === 'AbortError')
+                throw new Error('主 AI 请求超时，请检查 URL、模型或网络');
+            throw error;
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    async testPrimaryAiConnection() {
+        try {
+            const data = await this.generateAiData([{ role: 'user', content: '只回复 OK' }], { maxTokens: 8 });
+            const content = data.choices?.[0]?.message?.content?.trim();
+            return content ? { ok: true, message: `连接成功，模型返回：${content.slice(0, 60)}` } : { ok: false, message: '连接成功，但模型没有返回文本' };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    async testEmbeddingConnection() {
+        const api = this.adapter.config.embeddingApi;
+        if (!api.enabled)
+            return { ok: true, message: '向量模型未启用（可选）' };
+        if (!api.model.trim())
+            return { ok: false, message: '请填写向量模型名称' };
+        try {
+            const response = await fetch(this.endpointUrl(api.baseUrl, 'embeddings'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...(api.apiKey.trim() ? { Authorization: `Bearer ${api.apiKey.trim()}` } : {}) },
+                body: JSON.stringify({ model: api.model.trim(), input: ['NLKaleido connection test'], ...(api.dimensions ? { dimensions: api.dimensions } : {}) }),
+            });
+            if (!response.ok)
+                throw new Error(`向量请求失败（HTTP ${response.status}）：${(await response.text()).slice(0, 400)}`);
+            const data = await response.json();
+            const dims = data.data?.[0]?.embedding?.length ?? 0;
+            return dims > 0 ? { ok: true, message: `连接成功，返回 ${dims} 维向量` } : { ok: false, message: '接口未返回 embedding 数组' };
+        }
+        catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
+    }
+    async requestEmbeddingVectors(texts) {
+        const api = this.adapter.config.embeddingApi;
+        if (!api.enabled || !api.baseUrl.trim() || !api.model.trim())
+            throw new Error('向量模型尚未完整配置');
+        const response = await fetch(this.endpointUrl(api.baseUrl, 'embeddings'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(api.apiKey.trim() ? { Authorization: `Bearer ${api.apiKey.trim()}` } : {}) },
+            body: JSON.stringify({ model: api.model.trim(), input: texts, ...(api.dimensions ? { dimensions: api.dimensions } : {}) }),
+        });
+        if (!response.ok)
+            throw new Error(`向量请求失败（HTTP ${response.status}）：${(await response.text()).slice(0, 400)}`);
+        const data = await response.json();
+        const rows = [...(data.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+        const vectors = rows.map((row) => row.embedding).filter((vector) => Array.isArray(vector) && vector.length > 0);
+        if (vectors.length !== texts.length)
+            throw new Error(`向量接口返回数量不一致：请求 ${texts.length}，返回 ${vectors.length}`);
+        return vectors;
+    }
+    cosineSimilarity(a, b) {
+        if (!a.length || a.length !== b.length)
+            return -1;
+        let dot = 0;
+        let normA = 0;
+        let normB = 0;
+        for (let i = 0; i < a.length; i += 1) {
+            dot += a[i] * b[i];
+            normA += a[i] ** 2;
+            normB += b[i] ** 2;
+        }
+        return normA && normB ? dot / Math.sqrt(normA * normB) : -1;
+    }
+    /** 外部 embedding 语义检索；按 64 条分批并缓存正文向量，避免每轮重复付费。 */
+    async vectorMemorySearch(query, topK) {
+        const api = this.adapter.config.embeddingApi;
+        const atoms = this.adapter.memoryStore.atoms.filter((atom) => atom.scope === 'chat' && atom.status === 'active');
+        if (!api.enabled || !atoms.length)
+            return [];
+        const prefix = `${api.baseUrl}|${api.model}|${api.dimensions ?? ''}`;
+        const missing = [];
+        for (const atom of atoms) {
+            const key = `${prefix}|${atom.id}|${hash64(atom.content)}`;
+            if (!this.embeddingCache.has(key))
+                missing.push({ key, atom });
+        }
+        for (let offset = 0; offset < missing.length; offset += 64) {
+            const batch = missing.slice(offset, offset + 64);
+            const vectors = await this.requestEmbeddingVectors(batch.map((item) => item.atom.content));
+            batch.forEach((item, index) => this.embeddingCache.set(item.key, vectors[index]));
+        }
+        const [queryVector] = await this.requestEmbeddingVectors([query]);
+        const ranked = atoms.map((atom) => {
+            const key = `${prefix}|${atom.id}|${hash64(atom.content)}`;
+            return { atom, score: this.cosineSimilarity(queryVector, this.embeddingCache.get(key) ?? []) };
+        }).sort((a, b) => b.score - a.score).slice(0, Math.max(1, topK));
+        const now = Date.now();
+        for (const { atom } of ranked) {
+            atom.reinforcementCount += 1;
+            atom.lastAccessedAt = now;
+        }
+        return ranked.map((item) => item.atom);
+    }
+    renderMemoryAtoms(atoms, budgetTokens) {
+        if (!atoms.length || budgetTokens <= 0)
+            return null;
+        const lines = ['<记忆回溯>'];
+        let used = 8;
+        for (const atom of atoms) {
+            const line = `- [${atom.type}·语义相关] ${atom.content}`;
+            const cost = Math.ceil(line.length / 1.5);
+            if (used + cost > budgetTokens)
+                break;
+            lines.push(line);
+            used += cost;
+        }
+        if (lines.length === 1)
+            return null;
+        lines.push('</记忆回溯>');
+        return lines.join('\n');
+    }
+    async renderRelevantMemory(query, budgetTokens, topK = 10) {
+        const memoryApi = await this.ensureMemoryModule();
+        if (this.adapter.config.embeddingApi.enabled) {
+            try {
+                return this.renderMemoryAtoms(await this.vectorMemorySearch(query, topK), budgetTokens);
+            }
+            catch (error) {
+                console.warn('[NLKaleido] 向量检索失败，已回退关键词检索：', error);
+            }
+        }
+        return memoryApi.renderMemorySegment(this.adapter.memoryStore, query, { budgetTokens });
+    }
+    normalizeLoreEntries(world, raw) {
+        if (!raw || typeof raw !== 'object')
+            return [];
+        const source = raw.entries;
+        const values = Array.isArray(source)
+            ? source
+            : source && typeof source === 'object' ? Object.values(source) : [];
+        return values.flatMap((item, index) => {
+            if (!item || typeof item !== 'object')
+                return [];
+            const entry = item;
+            const keys = Array.isArray(entry.key) ? entry.key.filter((value) => typeof value === 'string') : [];
+            const name = String(entry.comment ?? entry.name ?? keys.join(' / ') ?? '').trim() || `条目 ${String(entry.uid ?? index + 1)}`;
+            const content = String(entry.content ?? '').replace(/\s+/g, ' ').trim();
+            return [{ world, name, enabled: entry.disable !== true && entry.enabled !== false, preview: content.slice(0, 120) }];
+        });
+    }
+    /** 当前角色实际绑定的主世界书、聊天世界书与卡内嵌世界书。 */
+    async listCurrentCharacterLorebooks() {
+        const context = this.globals.getContext();
+        const characterIndex = Number(context.characterId);
+        const character = Number.isInteger(characterIndex) && characterIndex >= 0 ? context.characters?.[characterIndex] : undefined;
+        const primary = character?.data?.extensions?.world?.trim();
+        const chatWorld = typeof context.chatMetadata?.world_info === 'string' ? context.chatMetadata.world_info.trim() : '';
+        const names = Array.from(new Set([primary, chatWorld].filter((name) => Boolean(name))));
+        const result = [];
+        if (typeof context.loadWorldInfo === 'function') {
+            for (const name of names) {
+                try {
+                    const raw = await context.loadWorldInfo(name);
+                    result.push({ name, source: name === primary ? 'character' : 'chat', entries: this.normalizeLoreEntries(name, raw) });
+                }
+                catch {
+                    result.push({ name, source: name === primary ? 'character' : 'chat', entries: [] });
+                }
+            }
+        }
+        const embedded = character?.data?.character_book;
+        if (embedded) {
+            const name = embedded.name?.trim() || `${character?.name ?? '当前角色'}的卡内世界书`;
+            const converted = typeof context.convertCharacterBook === 'function' ? context.convertCharacterBook(embedded) : embedded;
+            if (!result.some((book) => book.name === name))
+                result.push({ name, source: 'embedded', entries: this.normalizeLoreEntries(name, converted) });
+        }
+        return result;
     }
     /** 当前聊天的稳定会话键；所有跨 await 的任务都必须用它阻止旧结果串入新聊天。 */
     currentChatKey() {
@@ -8574,7 +8846,7 @@ class KaleidoStAdapter {
             ? `${recentStory.map((m) => m.content).join('\n')}\n${userInput}`.slice(-4e3)
             : undefined;
         const memorySegment = memoryApi && memoryQuery
-            ? memoryApi.renderMemorySegment(memoryStore, memoryQuery, { budgetTokens: contract.guardrails.maxStatusTokens })
+            ? await this.renderRelevantMemory(memoryQuery, contract.guardrails.maxStatusTokens, contract.memory?.injectTopK ?? 5)
             : null;
         // M15 剧情编排（§22：作者声明才启用；未启用 → 零剧情路径）
         const plotEnabled = contract.plot?.enabled === true;
@@ -8905,9 +9177,6 @@ class KaleidoStAdapter {
         const sessionKey = this.currentChatKey();
         this.adapter.plotRequestInFlight = true;
         try {
-            const context = this.globals.getContext();
-            if (typeof context.generateRawData !== 'function')
-                return;
             const stateText = renderPlotSegment(this.adapter.plotEvents, this.adapter.plotWinds);
             const eventsBefore = this.adapter.plotEvents.map((e) => ({ ...e }));
             const windsBefore = this.adapter.plotWinds.map((w) => ({ ...w }));
@@ -8933,7 +9202,7 @@ class KaleidoStAdapter {
             ];
             this.pendingJsonSchema = buildWorldEvolutionSchema();
             try {
-                const data = (await context.generateRawData({ prompt, api: 'openai' }, undefined));
+                const data = await this.generateAiData(prompt, { jsonSchema: this.pendingJsonSchema });
                 const content = data?.choices?.[0]?.message?.content ?? '';
                 if (!this.isSessionCurrent(sessionKey, state))
                     return;
@@ -9162,7 +9431,7 @@ class KaleidoStAdapter {
         const configApi = await this.ensureConfigModule();
         const store = this.globalStore();
         const stored = store[STORE_KEY_CONFIG];
-        const { config, migrated, errors } = configApi.migrateConfig(stored, []);
+        const { config, migrated, errors } = configApi.migrateConfig(stored, [configApi.migrateConfigV1ToV2]);
         // 首次安装没有配置是正常态；只有已有值损坏/迁移失败才告警。
         if (stored !== undefined && stored !== null && errors.length) {
             console.warn('[NLKaleido] 配置迁移/恢复：', errors);
@@ -9217,6 +9486,12 @@ class KaleidoStAdapter {
         const configApi = await this.ensureConfigModule();
         const probe = configApi.probeEnvironment(env);
         const decision = configApi.decideTier(probe, preferred);
+        // 档位只负责存储/检索能力，绝不能清空用户已经填写的模型端点。
+        decision.config.primaryAi = { ...this.adapter.config.primaryAi };
+        decision.config.embeddingApi = { ...this.adapter.config.embeddingApi };
+        if (decision.config.embeddingApi.enabled && decision.config.embeddingApi.baseUrl.trim() && decision.config.embeddingApi.model.trim()) {
+            decision.config.retrieval = 'vector';
+        }
         const snapshot = configApi.takeSnapshot(this.adapter.config, `apply-tier-${preferred}`);
         try {
             await this.saveConfig(decision.config);
@@ -9224,7 +9499,7 @@ class KaleidoStAdapter {
                 storageWriteOk: true,
                 retrievalOk: decision.config.retrieval === 'bm25',
                 injectionOk: true,
-                vectorReady: decision.config.retrieval === 'vector' && probe.webllm === 'ready',
+                vectorReady: decision.config.retrieval === 'vector' && (probe.webllm === 'ready' || decision.config.embeddingApi.enabled),
                 atomsCount: this.adapter.memoryStore.atoms.length,
                 maxAtoms: this.adapter.config.memory.maxAtoms,
             });
@@ -9316,16 +9591,10 @@ class KaleidoStAdapter {
     /** 归档总结请求（独立请求，不阻塞变量链路；失败返回 null） */
     async summarizeArchiveBatch(batch) {
         try {
-            const context = this.globals.getContext();
-            if (typeof context.generateRawData !== 'function')
-                return null;
             const lines = batch.map((entry) => `- 第${entry.turnId}轮 ${entry.path}${entry.source ? `（${entry.source}）` : ''}`).join('\n');
-            const data = (await context.generateRawData({
-                prompt: [
-                    { role: 'system', content: `你是长期记忆归档器。把下列变量变更事件压缩成 1-2 句长期摘要（中文，主语明确、可脱离上下文理解）。只输出摘要本身，不要 JSON、不要标签。\n${lines}` },
-                ],
-                api: 'openai',
-            }, undefined));
+            const data = await this.generateAiData([
+                { role: 'system', content: `你是长期记忆归档器。把下列变量变更事件压缩成 1-2 句长期摘要（中文，主语明确、可脱离上下文理解）。只输出摘要本身，不要 JSON、不要标签。\n${lines}` },
+            ]);
             const summary = data?.choices?.[0]?.message?.content?.trim() ?? '';
             return summary || null;
         }
@@ -9341,6 +9610,12 @@ class KaleidoStAdapter {
         if (!atoms.length)
             return '（无相关长期记忆）';
         return this.memoryModule.renderMemorySegment(this.adapter.memoryStore, query, { budgetTokens: 4000 }) ?? '（无相关长期记忆）';
+    }
+    async searchMemoryTextAsync(query, topK = 5) {
+        if (!this.memoryModule)
+            await this.ensureMemoryModule();
+        const rendered = await this.renderRelevantMemory(query, 4000, topK);
+        return rendered ?? '（无相关长期记忆）';
     }
     // ============================================================
     // 变量请求（§10.2 requestVariableUpdate / buildVariableRequest）
@@ -9399,20 +9674,11 @@ class KaleidoStAdapter {
     }
     /** 作者自然语言 → 可校验契约初稿；只返回草稿，用户确认保存前绝不改当前契约。 */
     async generateContractDraft(description) {
-        const context = this.globals.getContext();
-        if (typeof context.generateRawData !== 'function')
-            throw new Error('ST 缺少 generateRawData');
         const current = this.adapter.contract;
+        const lorebooks = await this.listCurrentCharacterLorebooks();
         const prompt = [
             { role: 'system', name: VREQ_MARKER, content: '' },
-            { role: 'system', content: [
-                    '你是 NLKaleido 契约设计助手。根据作者需求输出完整 JSON 契约，不得输出代码、Markdown 或解释。',
-                    '必须包含 version、id、schema、updateRules、displayRules、guardrails、invariants。',
-                    '每个 updateRules 项必须包含 path/type/default/updateMode/display；every_n_turns 必须带 everyN。',
-                    '优先生成少而清晰的字段；不要杜撰成人或敏感内容；不使用 eval/脚本。',
-                    current ? `当前契约可作修改基底：${JSON.stringify(current)}` : '',
-                    `作者需求：${description.trim()}`,
-                ].filter(Boolean).join('\n\n') },
+            { role: 'system', content: buildAuthorSkillPrompt({ request: description, current, lorebooks }) },
         ];
         this.pendingJsonSchema = {
             name: 'nlkaleido_contract_draft',
@@ -9420,7 +9686,7 @@ class KaleidoStAdapter {
             value: { type: 'object', additionalProperties: true },
         };
         try {
-            const data = await context.generateRawData({ prompt, api: 'openai' }, undefined);
+            const data = await this.generateAiData(prompt, { jsonSchema: this.pendingJsonSchema });
             const raw = tolerantJsonParse(data?.choices?.[0]?.message?.content ?? '');
             const contract = parseContract(raw);
             const errors = validateContract(contract, { registry: this.extensions.registry });
@@ -9434,10 +9700,6 @@ class KaleidoStAdapter {
     }
     /** VariableTransport 实现（单次模式）：generateRawData → 非流式返回完整 data（U5） */
     async requestVariableUpdate(messages, jsonSchema) {
-        const context = this.globals.getContext();
-        if (typeof context.generateRawData !== 'function') {
-            throw new Error('ST 缺少 generateRawData（detectVersion 应已拦截）');
-        }
         // VREQ 标记（§10.2 事件隔离：SETTINGS_READY 只重排自己的请求）
         const marked = [
             { role: 'system', name: VREQ_MARKER, content: '' },
@@ -9449,10 +9711,7 @@ class KaleidoStAdapter {
         // 本轮 schema（含 §20.5 reflection 字段）暂存到适配层字段，供 SETTINGS_READY 同步取用。
         this.pendingJsonSchema = jsonSchema;
         try {
-            const data = (await context.generateRawData({
-                prompt: marked,
-                api: 'openai',
-            }, undefined));
+            const data = await this.generateAiData(marked, { jsonSchema });
             // 从 choices[0].message.content 提取 JSON（tolerantJsonParse + G5 包裹兜底）
             const content = data?.choices?.[0]?.message?.content ?? '';
             const parsed = parseVariableResponse(content);
@@ -9539,9 +9798,6 @@ class KaleidoStAdapter {
             throw new Error('provider 探针会产生真实 token/费用；请显式传 confirmCost:true');
         if (this.providerProbeRunning)
             throw new Error('已有 provider 探针正在运行');
-        const generateRawData = this.globals.getContext().generateRawData;
-        if (typeof generateRawData !== 'function')
-            throw new Error('ST 缺少 generateRawData，无法运行 provider 探针');
         const rounds = Math.max(2, Math.min(5, Math.trunc(options.rounds ?? 2)));
         const stablePrefix = [
             'NLKaleido provider cache probe v1。',
@@ -9554,14 +9810,10 @@ class KaleidoStAdapter {
         try {
             for (let index = 0; index < rounds; index += 1) {
                 const startedAt = performance.now();
-                const data = await generateRawData({
-                    api: 'openai',
-                    max_tokens: 8,
-                    prompt: [
-                        { role: 'system', content: stablePrefix },
-                        { role: 'user', content: `探针轮次 ${index + 1}；只回复 OK。` },
-                    ],
-                }, undefined);
+                const data = await this.generateAiData([
+                    { role: 'system', content: stablePrefix },
+                    { role: 'user', content: `探针轮次 ${index + 1}；只回复 OK。` },
+                ], { maxTokens: 8 });
                 const metrics = this.readUsage(data);
                 const hitMiss = this.extractHitMiss(metrics);
                 captures.push({
@@ -9718,11 +9970,11 @@ class KaleidoStAdapter {
         await this.persistState(state);
         return { ok: result.rejected.length === 0, errors: result.rejected.map((r) => `${r.op.path}：${r.reason}`) };
     }
-    /** §20.9 memory_search：BM25 检索长期记忆（top-K，含强化） */
+    /** §20.9 memory_search：优先语义检索，失败自动回退 BM25。 */
     async toolMemorySearch(query) {
         if (!query)
             return '（缺少 query）';
-        return this.searchMemoryText(query, this.adapter.contract?.memory?.injectTopK ?? 5);
+        return this.searchMemoryTextAsync(query, this.adapter.contract?.memory?.injectTopK ?? 5);
     }
     /** §20.9 memory_memorize：主动写入长期记忆（classifyAtom 兜底分类 + 置信度门控） */
     async toolMemoryMemorize(args) {
@@ -9754,10 +10006,6 @@ class KaleidoStAdapter {
         const { contract, state } = this.adapter;
         if (!contract || !state)
             return null;
-        const context = this.globals.getContext();
-        if (typeof context.generateRawData !== 'function')
-            throw new Error('ST 缺少 generateRawData，无法运行多步 Agent');
-        const generateRawData = context.generateRawData;
         const sessionKey = this.currentChatKey();
         const schema = {
             name: 'nlkaleido_multi_step_decision',
@@ -9812,7 +10060,7 @@ class KaleidoStAdapter {
                 ];
                 this.pendingJsonSchema = schema;
                 try {
-                    const data = (await generateRawData({ prompt, api: 'openai' }, undefined));
+                    const data = await this.generateAiData(prompt, { jsonSchema: schema });
                     if (!this.isSessionCurrent(sessionKey, state))
                         throw new StaleChatSessionError();
                     const parsed = tolerantJsonParse(data?.choices?.[0]?.message?.content ?? '');
@@ -10173,8 +10421,7 @@ class KaleidoStateBridge {
             type: field.type,
             value: this.getVariable(field.path),
             display: field.display,
-            frontendWritable: field.ownership?.writers?.includes('*') === true
-                || field.ownership?.writers?.includes('frontend') === true,
+            frontendWritable: true,
             description: field.changeRule,
         }));
     }
@@ -10213,15 +10460,12 @@ class KaleidoStateBridge {
         const ops = entries.map(([path, value]) => ({
             op: 'replace', path, value, confidence: 'high', rationale: `${source} 主动写入`,
         }));
-        const validated = validateOps(contract, state, ops, state.meta.lastTurnId, { source, allowFixed: true });
+        const validated = validateOps(contract, state, ops, state.meta.lastTurnId, { source, allowFixed: true, skipOwnership: source === 'frontend' });
         if (validated.rejected.length) {
             const first = validated.rejected[0];
             let friendly = first.reason
                 .replace(/^unknown_path：/, '')
                 .replace(/^type_mismatch：/, '值类型不正确：');
-            if (first.reason.startsWith('not_owner：')) {
-                friendly = `变量 ${first.op.path} 未开启“允许前端脚本写入”`;
-            }
             return { ok: false, error: friendly };
         }
         const before = structuredClone(state);
@@ -22976,7 +23220,7 @@ function createField(path = '新分组.新字段') {
     return {
         path, type: 'string', default: '', updateMode: 'every_turn', dynamic: true, reviewRequired: true,
         display: true, persist: 'chat', stability: 'volatile',
-        ownership: { owner: 'agent', writers: ['agent', 'manual', 'frontend'], priority: 0, merge: 'last_write', audit: true },
+        ownership: { owner: 'agent', writers: ['agent', 'manual'], priority: 0, merge: 'last_write', audit: true },
     };
 }
 function uniqueFieldPath(contract, preferred) {
@@ -23108,6 +23352,13 @@ function dispatch(payload) {
         return { ok: false, error: '面板尚未连接变量系统' };
     return mountedBridge.dispatch(payload);
 }
+function scrollWorkbenchTop() {
+    requestAnimationFrame(() => {
+        const body = document.querySelector('.nlkaleido-workbench-body');
+        if (body)
+            body.scrollTop = 0;
+    });
+}
 /** 状态板（玩家视图，§6.1：只读展示，不暴露契约/调试） */
 const PlayerView = defineComponent({
     name: 'NlPlayerView',
@@ -23123,6 +23374,21 @@ const PlayerView = defineComponent({
                 fields: group.fields.filter((field) => field.display).map((field) => ({ ...field, value: getAtPath(store.statData, field.path) })),
             })).filter((group) => group.fields.length);
         };
+        const visualValue = (type, value) => {
+            if (type === 'boolean')
+                return h('span', { class: value ? 'nlk-bool-pill nlk-bool-on' : 'nlk-bool-pill' }, value ? '是 · 已开启' : '否 · 未开启');
+            if (type === 'list' && Array.isArray(value))
+                return h('div', { class: 'nlk-value-chips' }, value.length
+                    ? value.slice(0, 6).map((item) => h('span', null, String(item))).concat(value.length > 6 ? [h('span', null, `+${value.length - 6}`)] : [])
+                    : [h('small', null, '空清单')]);
+            if ((type === 'object' || type === 'kv') && value && typeof value === 'object' && !Array.isArray(value)) {
+                const entries = Object.entries(value);
+                return h('div', { class: 'nlk-value-pairs' }, entries.length
+                    ? entries.slice(0, 5).map(([key, item]) => h('span', null, [h('b', null, key), h('em', null, String(item))]))
+                    : [h('small', null, '暂无内容')]);
+            }
+            return h('strong', { class: type === 'number' ? 'nlk-number-value' : '' }, value == null || value === '' ? '—' : String(value));
+        };
         return () => {
             const contract = adapter.adapter.contract;
             const state = adapter.adapter.state;
@@ -23137,7 +23403,7 @@ const PlayerView = defineComponent({
                 ]);
             return h('div', { class: 'nlk-dashboard' }, [
                 h('section', { class: 'nlk-dashboard-hero' }, [
-                    h('div', null, [h('div', { class: 'nlk-eyebrow' }, '当前状态'), h('h2', null, '角色与世界状态'), h('p', null, `${visibleGroups.reduce((sum, group) => sum + group.fields.length, 0)} 项正在展示 · 数据版本 ${state.revision.seq}`)]),
+                    h('div', null, [h('div', { class: 'nlk-eyebrow' }, '实时变量'), h('h2', null, '变量概览'), h('p', null, `当前共有 ${visibleGroups.reduce((sum, group) => sum + group.fields.length, 0)} 个玩家可见变量 · 数据版本 ${state.revision.seq}`)]),
                     h('div', { class: 'nlk-health' }, [h('span', { class: 'nlk-health-dot' }), '运行正常']),
                 ]),
                 h('section', { class: 'nlk-kpis' }, [
@@ -23151,7 +23417,7 @@ const PlayerView = defineComponent({
                     h('div', { class: 'nlk-card-title' }, [h('span', null, group.name), h('small', null, `${group.fields.length} 项`)]),
                     ...group.fields.map((field) => h('div', { class: 'nlk-status-row' }, [
                         h('span', null, field.path.split('.').slice(1).join('.') || field.path),
-                        h('strong', null, typeof field.value === 'string' ? field.value : json(field.value)),
+                        h('div', { class: 'nlk-variable-value' }, [h('small', { class: 'nlk-type-badge' }, field.type), visualValue(field.type, field.value)]),
                     ])),
                 ]))),
                 contract.achievements?.length ? h('section', { class: 'nlk-card nlk-achievements' }, [
@@ -23181,6 +23447,21 @@ const ContractEditor = defineComponent({
         const feedbackKind = ref('info');
         const aiPrompt = ref('');
         const aiBusy = ref(false);
+        const lorebooks = ref([]);
+        const loreLoading = ref(false);
+        const refreshLorebooks = async () => {
+            loreLoading.value = true;
+            try {
+                lorebooks.value = await adapter.listCurrentCharacterLorebooks();
+            }
+            catch (error) {
+                tell(`读取世界书失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+            }
+            finally {
+                loreLoading.value = false;
+            }
+        };
+        onMounted(() => { void refreshLorebooks(); });
         const loadDraft = (text) => {
             try {
                 const parsed = JSON.parse(text);
@@ -23283,10 +23564,12 @@ const ContractEditor = defineComponent({
             if (!draft.value)
                 return;
             const rules = [...(draft.value.ejs ?? [])];
+            const firstBook = lorebooks.value[0];
+            const firstEntry = firstBook?.entries[0];
             rules.push({
                 id: `rule-${rules.length + 1}`,
                 condition: { var: selectedPath.value || Object.keys(draft.value.updateRules)[0] || '变量', op: 'exists' },
-                entries: [{ world: '世界书名称', name: '条目名称' }], mode: 'on_match', entryPlacement: 'l3_tail',
+                entries: [{ world: firstBook?.name ?? '请选择世界书', name: firstEntry?.name ?? '请选择条目' }], mode: 'on_match', entryPlacement: 'l3_tail',
             });
             draft.value.ejs = rules;
             changed();
@@ -23348,20 +23631,6 @@ const ContractEditor = defineComponent({
             catch {
                 return value;
             }
-        };
-        const setFrontendWritable = (path, enabled) => {
-            if (!draft.value)
-                return;
-            const currentField = draft.value.updateRules[path];
-            if (!currentField)
-                return;
-            const current = currentField.ownership ?? { owner: 'agent', writers: ['agent', 'manual'], priority: 0, merge: 'last_write', audit: true };
-            const writers = current.writers ?? [current.owner];
-            draft.value = upsertField(draft.value, path, {
-                ...currentField,
-                ownership: { ...current, writers: enabled ? Array.from(new Set([...writers, 'frontend'])) : writers.filter((writer) => writer !== 'frontend' && writer !== '*') },
-            });
-            changed();
         };
         const defaultEditor = (field) => {
             if (field.type === 'boolean')
@@ -23431,56 +23700,35 @@ const ContractEditor = defineComponent({
                             input('变量名称（分组.名称）', field.path, (value) => patchField({ path: value }), {}, '唯一名称。AI、显示模板和前端脚本都用它定位这个值，例如「角色.好感度」。'),
                             select('保存什么内容', field.type, [['string', '一段文字'], ['number', '一个数字'], ['boolean', '是 / 否'], ['list', '一组有顺序的项目'], ['kv', '可以动态增加的名称和值'], ['object', '一个包含多个属性的对象']], (value) => { const type = value; patchField({ type, default: emptyValueForType(type) }); }, '选择后，下方会出现对应的可视化构造器；不需要手写 JSON。'),
                             defaultEditor(field),
-                            select('什么时候让 AI 检查它', field.updateMode, [['every_turn', '每轮剧情结束后'], ['every_n_turns', '每隔几轮'], ['trigger', '只有说明中的条件出现时'], ['fixed', 'AI 不自动修改']], (value) => patchField({ updateMode: value, everyN: value === 'every_n_turns' ? field.everyN ?? 3 : undefined }), '这里只控制 AI 自动更新；作者和已授权的前端脚本仍可主动写入。'),
+                            select('什么时候让 AI 检查它', field.updateMode, [['every_turn', '每轮剧情结束后'], ['every_n_turns', '每隔几轮'], ['trigger', '只有说明中的条件出现时'], ['fixed', 'AI 不自动修改']], (value) => patchField({ updateMode: value, everyN: value === 'every_n_turns' ? field.everyN ?? 3 : undefined }), '这里只控制 AI 自动更新；作者和角色卡前端仍可主动写入。'),
                             field.updateMode === 'every_n_turns' ? input('每隔多少轮检查', field.everyN ?? 3, (value) => patchField({ everyN: Math.max(1, Number(value) || 1) }), { type: 'number', min: 1 }, '数值越大越省模型上下文，变化也会更晚反映。') : null,
                             select('离开当前聊天后是否保留', field.persist ?? 'chat', [['chat', '只在当前聊天'], ['run', '同一周目继续保留'], ['global', '跨聊天和角色卡共享']], (value) => patchField({ persist: value }), '大多数剧情变量选“只在当前聊天”；账号级设置才适合全局共享。'),
                             select('发送给 AI 的缓存方式', field.stability ?? 'volatile', [['volatile', '经常变化'], ['stable', '较少变化，优先节省上下文'], ['frozen', '完全不发给变量 AI']], (value) => patchField({ stability: value }), '一般保持“经常变化”。只有确定不常改的长文本才选稳定或冻结。'),
                             h('label', { class: 'nlk-check nlk-check-explain' }, [h('input', { type: 'checkbox', checked: field.display, onChange: (e) => patchField({ display: e.target.checked }) }), h('span', null, [h('strong', null, '在玩家页面显示'), h('small', null, '关闭后仍会保存，只是不展示给玩家。')])]),
                             h('label', { class: 'nlk-check nlk-check-explain nlk-check-important' }, [h('input', { type: 'checkbox', checked: field.reviewRequired !== false, onChange: (e) => patchField({ reviewRequired: e.target.checked }) }), h('span', null, [h('strong', null, '到期时必须逐项判断'), h('small', null, '推荐开启。Agent 必须明确回答“更新 / 不变”并说明证据；满足规则却不提交修改会被退回重试。')])]),
-                            h('label', { class: 'nlk-check nlk-check-explain' }, [h('input', {
-                                    type: 'checkbox',
-                                    checked: (field.ownership?.writers ?? []).includes('*') || (field.ownership?.writers ?? []).includes('frontend'),
-                                    onChange: (e) => {
-                                        setFrontendWritable(field.path, e.target.checked);
-                                    },
-                                }), h('span', null, [h('strong', null, '允许前端脚本写入'), h('small', null, '开启后，角色卡界面可通过正式 API 修改这个变量。每次写入都会校验并记入审计。')])]),
                         ]),
                         h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'AI 应该怎样更新它'), h('small', { class: 'nlk-help' }, '用自然语言写清楚触发条件、增减幅度和边界。它会直接成为变量 AI 的判断依据。'), h('textarea', { class: 'nlk-input nlk-textarea', value: field.changeRule ?? '', onInput: (e) => patchField({ changeRule: e.target.value }), placeholder: '例：角色得到明确帮助时增加 1～3；普通寒暄不变化；范围始终保持 0～100。' })]),
                         input('更新时还要参考的变量（可选）', (field.dependencies ?? []).join(', '), (value) => patchField({ dependencies: value.split(',').map((x) => x.trim()).filter(Boolean) }), {}, '填写其他变量的完整名称，用逗号分隔。系统会把它们一起提供给 AI。'),
-                        h('article', { class: 'nlk-api-card' }, [
-                            h('div', null, [h('strong', null, '角色卡前端如何读写'), h('small', null, (field.ownership?.writers ?? []).includes('frontend') || (field.ownership?.writers ?? []).includes('*') ? '这个变量已允许前端写入。set 完成后才代表校验、派生计算和保存全部成功。' : '目前只能读取。勾选上方“允许前端脚本写入”后才可修改。')]),
-                            h('code', null, `const value = NLKaleido.variables.get('${field.path}');\nawait NLKaleido.variables.set('${field.path}', ${JSON.stringify(field.default)});`),
-                        ]),
                     ]) : h('div', { class: 'nlk-empty' }, '从左侧选择一个变量，或点“+”新建。'),
-                ]);
-            }
-            else if (section.value === 'api') {
-                const fields = Object.values(contract.updateRules);
-                content = h('div', { class: 'nlk-stack' }, [
-                    h('article', { class: 'nlk-api-overview' }, [
-                        h('div', { class: 'nlk-info-icon' }, '</>'),
-                        h('div', null, [
-                            h('div', { class: 'nlk-pane-title' }, '角色卡前端 API'),
-                            h('p', null, '这里不需要填写网址、模型或 API Key。角色卡里的 HTML/JavaScript 直接使用当前页面的 NLKaleido.variables。你只需决定每个变量是否允许前端修改。'),
-                            h('code', null, "const state = NLKaleido.variables.get('角色.好感度');\nconst result = await NLKaleido.variables.set('角色.好感度', 80);\nif (!result.ok) console.warn(result.error);"),
-                        ]),
-                    ]),
-                    fields.length ? h('div', { class: 'nlk-api-field-grid' }, fields.map((item) => {
-                        const enabled = (item.ownership?.writers ?? []).includes('*') || (item.ownership?.writers ?? []).includes('frontend');
-                        return h('article', { class: enabled ? 'nlk-api-field nlk-api-field-on' : 'nlk-api-field', key: item.path }, [
-                            h('div', null, [h('strong', null, item.path), h('small', null, `${item.type} · ${item.display ? '玩家可见' : '仅后台保存'}`)]),
-                            h('label', { class: 'nlk-switch-line' }, [h('span', null, enabled ? '允许前端写入' : '只允许读取'), h('input', { type: 'checkbox', checked: enabled, onChange: (e) => setFrontendWritable(item.path, e.target.checked) })]),
-                        ]);
-                    })) : h('div', { class: 'nlk-empty' }, '先在“变量与显示”中创建变量，这里才会出现可授权项。'),
-                    h('div', { class: 'nlk-callout' }, '写入不是直接改对象：系统会先检查变量是否声明、类型是否正确、是否获得权限、是否违反跨变量规则，然后重算派生值、写入修改记录并保存。'),
                 ]);
             }
             else if (section.value === 'ces') {
                 content = h('div', { class: 'nlk-stack' }, [
                     h('div', { class: 'nlk-callout' }, '当变量满足条件时，系统会自动启用指定的世界书条目。例如“好感度 ≥ 80”时启用恋人阶段设定。判断在本地完成，不会多调用一次模型。'),
+                    h('section', { class: 'nlk-lore-browser' }, [
+                        h('div', null, [h('strong', null, '当前角色的世界书'), h('small', null, loreLoading.value ? '正在读取…' : lorebooks.value.length ? `已读取 ${lorebooks.value.length} 本、${lorebooks.value.reduce((sum, book) => sum + book.entries.length, 0)} 个条目` : '没有发现已绑定或卡内嵌世界书')]),
+                        h('button', { class: 'nlk-btn nlk-btn-sm', disabled: loreLoading.value, onClick: () => { void refreshLorebooks(); } }, '重新读取'),
+                    ]),
+                    ...lorebooks.value.map((book) => h('details', { class: 'nlk-lore-book' }, [
+                        h('summary', null, `${book.name} · ${book.entries.length} 个条目`),
+                        h('div', { class: 'nlk-lore-entry-list' }, book.entries.map((item) => h('div', { class: 'nlk-lore-entry' }, [h('strong', null, item.name), h('small', null, item.preview || '（条目无预览文本）')]))),
+                    ])),
                     ...(contract.ejs ?? []).map((rule, index) => {
                         const condition = 'var' in rule.condition ? rule.condition : null;
                         const entry = rule.entries[0];
+                        const selectedBook = lorebooks.value.find((book) => book.name === entry.world);
+                        const bookOptions = lorebooks.value.length ? lorebooks.value.map((book) => [book.name, `${book.name}（${book.entries.length} 条）`]) : [[entry.world, entry.world]];
+                        const entryOptions = selectedBook?.entries.length ? selectedBook.entries.map((item) => [item.name, item.name]) : [[entry.name, entry.name]];
                         return h('article', { class: 'nlk-card' }, [
                             h('div', { class: 'nlk-pane-title' }, [input('规则名称', rule.id, (value) => patchCes(index, { id: value }), {}, '仅用于作者识别和排错，不会展示给玩家。'), h('button', { class: 'nlk-btn nlk-btn-sm nlk-danger', onClick: () => removeCes(index) }, '删除')]),
                             condition ? h('div', { class: 'nlk-form-grid' }, [
@@ -23488,12 +23736,35 @@ const ContractEditor = defineComponent({
                                 select('满足什么关系', condition.op, [['==', '等于'], ['!=', '不等于'], ['>', '大于'], ['>=', '大于等于'], ['<', '小于'], ['<=', '小于等于'], ['exists', '已经存在']], (value) => patchCes(index, { condition: { ...condition, op: value } })),
                                 input('和什么值比较', condition.value == null ? '' : String(condition.value), (value) => patchCes(index, { condition: { ...condition, value } })),
                                 select('何时启用条目', rule.mode, [['on_match', '条件成立时'], ['on_not_match', '条件不成立时']], (value) => patchCes(index, { mode: value })),
-                                input('世界书名称', entry.world, (value) => patchCes(index, { entries: [{ ...entry, world: value }, ...rule.entries.slice(1)] })),
-                                input('其中的条目名称', entry.name, (value) => patchCes(index, { entries: [{ ...entry, name: value }, ...rule.entries.slice(1)] })),
+                                select('选择世界书', entry.world, bookOptions, (value) => { const first = lorebooks.value.find((book) => book.name === value)?.entries[0]; patchCes(index, { entries: [{ ...entry, world: value, name: first?.name ?? entry.name }, ...rule.entries.slice(1)] }); }, '直接读取当前角色已绑定和卡内嵌世界书。'),
+                                select('选择其中的条目', entry.name, entryOptions, (value) => patchCes(index, { entries: [{ ...entry, name: value }, ...rule.entries.slice(1)] }), '只有选中的真实条目会被条件规则启用。'),
                             ]) : h('div', { class: 'nlk-callout' }, '这条规则包含多个组合条件，需要在“开发者设置”中编辑。'),
                         ]);
                     }),
                     h('button', { class: 'nlk-btn nlk-btn-primary', onClick: addCes }, '+ 新建自动启用规则'),
+                ]);
+            }
+            else if (section.value === 'dice') {
+                const dice = contract.dice ?? { enabled: false, system: 'coc', defaultFormula: '1d100', defaultTarget: 50 };
+                const patchDice = (patch) => { contract.dice = { ...dice, ...patch }; changed(); };
+                const chooseSystem = (system) => patchDice({
+                    system,
+                    defaultFormula: system === 'coc' ? '1d100' : system === 'dnd' ? '1d20' : dice.defaultFormula ?? '1d100',
+                    defaultTarget: system === 'coc' ? 50 : system === 'dnd' ? 15 : dice.defaultTarget ?? 50,
+                });
+                content = h('div', { class: 'nlk-stack' }, [
+                    h('div', { class: 'nlk-callout' }, '这里是作者定义检定规则的地方。玩家只会看到“发起检定”和结果，不会看到公式、目标值、预设导入或测试工具。'),
+                    h('article', { class: dice.enabled ? 'nlk-system-card nlk-system-on' : 'nlk-system-card' }, [h('div', null, [h('strong', null, '启用这张卡的检定系统'), h('p', null, '启用后作者可测试，玩家可按你设定的默认规则进行检定。')]), h('input', { type: 'checkbox', checked: dice.enabled, onChange: (e) => patchDice({ enabled: e.target.checked }) })]),
+                    h('div', { class: 'nlk-dice-system-grid' }, [
+                        ['coc', 'COC 百分骰', '掷 1～100，结果不高于属性值即成功。适合调查、恐怖与技能百分比。'],
+                        ['dnd', 'D20 难度制', '掷 1～20 加修正，结果达到难度值即成功。适合冒险和战斗。'],
+                        ['custom', '自定义', '自己填写骰子公式和目标值。适合特殊世界观。'],
+                    ].map(([key, name, desc]) => h('button', { class: dice.system === key ? 'nlk-dice-system nlk-dice-system-active' : 'nlk-dice-system', onClick: () => chooseSystem(key) }, [h('strong', null, name), h('small', null, desc)]))),
+                    h('article', { class: 'nlk-card' }, [h('div', { class: 'nlk-pane-title' }, '默认检定'), h('div', { class: 'nlk-form-grid' }, [
+                            input('默认骰子', dice.defaultFormula ?? '1d100', (value) => patchDice({ defaultFormula: value }), {}, '常用写法：1d100、1d20、2d20kh1（两个取高）。不需要懂更多语法。'),
+                            input(dice.system === 'dnd' ? '默认难度值' : '默认成功目标', dice.defaultTarget ?? 50, (value) => patchDice({ defaultTarget: Number(value) || 0 }), { type: 'number' }, dice.system === 'dnd' ? '例如 10 简单、15 普通、20 困难。' : '例如属性值 50：掷出 50 或以下成功。'),
+                        ]), h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '给玩家看的结果说明（可选）'), h('textarea', { class: 'nlk-input nlk-textarea', value: dice.resultHint ?? '', onInput: (e) => patchDice({ resultHint: e.target.value }), placeholder: '例：失败不会阻断剧情，而是带来额外代价或暴露风险。' })])]),
+                    h('div', { class: 'nlk-callout' }, '保存后，可到左侧“检定测试”实际掷几次确认手感。高级预设与 JSON 导入放在测试页的折叠区，不影响普通作者。'),
                 ]);
             }
             else if (section.value === 'systems') {
@@ -23504,7 +23775,6 @@ const ContractEditor = defineComponent({
                     h('div', { class: 'nlk-callout' }, '勾选需要的功能后，点击页面右上角“检查并保存”才会生效。关闭的功能不会加载对应数据和计算。'),
                     systemCard('长期记忆', '让系统记住跨越很多轮的重要事实，并在相关时自动找回来。', contract.memory?.enabled === true, (on) => toggleSystem('memory', on)),
                     systemCard('世界推演', '让聊天外的事件继续发展，并把玩家可能听到的消息带回剧情。', contract.plot?.enabled === true, (on) => toggleSystem('plot', on)),
-                    systemCard('掷骰与检定', '提供安全的骰子公式、常用预设和检定历史。', contract.dice?.enabled === true, (on) => toggleSystem('dice', on)),
                     h('article', { class: 'nlk-card' }, [h('div', { class: 'nlk-pane-title' }, '复杂变量推理'), h('div', { class: 'nlk-callout' }, '当变量很多、互相影响时，可以让变量 AI 分几步分析。普通角色卡保持关闭即可。'), h('div', { class: 'nlk-form-grid' }, [
                             input('最多分析几步（0 表示关闭）', contract.guardrails.maxSteps, (value) => { contract.guardrails.maxSteps = Math.max(0, Number(value) || 0); changed(); }, { type: 'number', min: 0 }),
                             input('每一步最多使用多少文字预算', contract.guardrails.maxTokensPerStep, (value) => { contract.guardrails.maxTokensPerStep = Math.max(128, Number(value) || 2048); changed(); }, { type: 'number', min: 128 }, '上限越高，复杂判断空间越大，模型用量也可能更高。'),
@@ -23522,9 +23792,14 @@ const ContractEditor = defineComponent({
                     h('div', null, [h('div', { class: 'nlk-eyebrow' }, '作者设置向导'), h('h2', null, '这张卡要记录什么'), h('p', null, `${contract.id} · ${Object.keys(contract.updateRules).length} 个变量 · ${(contract.ejs ?? []).length} 条自动启用规则`)]),
                     h('div', { class: 'nlk-save-area' }, [h('span', { class: dirty.value ? 'nlk-dirty' : 'nlk-saved' }, dirty.value ? '● 有未保存修改' : '✓ 已保存'), h('button', { class: 'nlk-btn', onClick: exportJson }, '导出备份'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: save, disabled: !dirty.value }, '检查并保存')]),
                 ]),
-                h('section', { class: 'nlk-ai-draft' }, [h('div', null, [h('strong', null, '告诉 AI 你想记录什么'), h('small', null, '它只会生成一份待检查的草稿')]), h('input', { class: 'nlk-input', value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: '例：追踪三名角色的好感度、队伍资金和世界阶段，每 3 轮检查一次阶段' }), h('button', { class: 'nlk-btn', disabled: aiBusy.value, onClick: generateDraft }, aiBusy.value ? '生成中…' : '帮我生成')]),
+                h('section', { class: 'nlk-ai-helper' }, [
+                    h('div', { class: 'nlk-ai-helper-head' }, [h('div', { class: 'nlk-ai-orb' }, '✦'), h('div', null, [h('strong', null, 'AI 帮帮 · 角色卡设计助手'), h('small', null, '会按专用创作流程设计变量、更新证据、世界书联动和可选系统，只生成待检查草稿。')])]),
+                    h('div', { class: 'nlk-ai-quick' }, ['追踪角色关系与好感变化', '设计背包、金钱和任务进度', '根据当前世界书建立阶段联动', '启用世界推演并追踪风声'].map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiPrompt.value = text; } }, text))),
+                    h('textarea', { class: 'nlk-input nlk-ai-prompt', rows: 3, value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: '用自然语言描述你希望这张卡记录和自动处理什么。例：记录三名角色的好感和关系阶段；好感 80 后启用世界书“恋人阶段”；重要约定进入长期记忆。' }),
+                    h('div', { class: 'nlk-ai-helper-foot' }, [h('span', null, loreLoading.value ? '正在读取当前角色世界书…' : `可参考 ${lorebooks.value.length} 本世界书、${lorebooks.value.reduce((sum, book) => sum + book.entries.length, 0)} 个真实条目`), h('button', { class: 'nlk-btn nlk-btn-primary', disabled: aiBusy.value, onClick: generateDraft }, aiBusy.value ? '正在设计…' : '生成可检查方案')]),
+                ]),
                 feedback.value ? h('div', { class: `nlk-toast nlk-toast-${feedbackKind.value}` }, feedback.value) : null,
-                h('nav', { class: 'nlk-subnavs' }, [nav('fields', '① 变量与显示', Object.keys(contract.updateRules).length), nav('api', '② 前端 API'), nav('ces', '③ 自动启用世界书', (contract.ejs ?? []).length), nav('systems', '④ 可选功能'), nav('advanced', '开发者设置')]),
+                h('nav', { class: 'nlk-subnavs' }, [nav('fields', '① 变量设计', Object.keys(contract.updateRules).length), nav('ces', '② 世界书联动', (contract.ejs ?? []).length), nav('dice', '③ 检定规则'), nav('systems', '④ 其他功能'), nav('advanced', '开发者设置')]),
                 content,
             ]);
         };
@@ -23739,8 +24014,8 @@ const DiceView = defineComponent({
     setup() {
         const store = useNlStore();
         const adapter = useAdapter();
-        const formula = ref('1d100');
-        const target = ref('50');
+        const formula = ref(adapter.adapter.contract?.dice?.defaultFormula ?? '1d100');
+        const target = ref(String(adapter.adapter.contract?.dice?.defaultTarget ?? 50));
         const suggestion = ref('');
         const presetText = ref('');
         const lastResult = ref('');
@@ -23772,30 +24047,43 @@ const DiceView = defineComponent({
                 lastResult.value = `JSON 解析失败：${error instanceof Error ? error.message : String(error)}`;
             }
         };
+        const playerRoll = () => {
+            const dice = adapter.adapter.contract?.dice;
+            const result = dice?.system === 'custom'
+                ? dispatch({ action: 'diceRoll', formula: dice.defaultFormula ?? '1d100' })
+                : dispatch({ action: 'diceCheck', targetValue: dice?.defaultTarget ?? (dice?.system === 'dnd' ? 15 : 50), diceType: dice?.system === 'dnd' ? 20 : 100 });
+            lastResult.value = result.ok ? `本次结果：${json(result.result)}` : `检定失败：${result.error}`;
+        };
         return () => {
             if (!enabled()) {
                 return h('div', { class: 'nlk-section' }, [
-                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '⬡'), h('h2', null, '掷骰与检定目前是关闭的'), h('p', null, '开启后可以使用安全骰子公式、检定预设和历史记录。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'systems'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去作者页开启')]),
+                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '⬡'), h('h2', null, '这张卡没有启用检定'), h('p', null, store.roleMode === 'author' ? '在作者端选择 COC、D20 或自定义规则后再测试。' : '作者没有为这张角色卡开放检定功能。'), store.roleMode === 'author' ? h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'dice'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去定义检定规则') : null]),
+                ]);
+            }
+            if (store.roleMode === 'player') {
+                return h('div', { class: 'nlk-section' }, [
+                    h('section', { class: 'nlk-page-head' }, [h('div', { class: 'nlk-eyebrow' }, '角色行动'), h('h2', null, '发起检定'), h('p', null, adapter.adapter.contract?.dice?.resultHint || '点击后按这张卡的规则进行一次检定。具体公式和难度由作者设定。')]),
+                    h('article', { class: 'nlk-player-dice' }, [h('div', { class: 'nlk-player-dice-mark' }, '⬡'), h('strong', null, '准备好了吗？'), h('p', null, '玩家端只显示操作和结果，不展示公式、目标值或作者预设。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: playerRoll }, '进行一次检定')]),
+                    lastResult.value ? h('div', { class: 'nlk-dice-result' }, lastResult.value) : null,
                 ]);
             }
             return h('div', { class: 'nlk-section' }, [
-                h('div', { class: 'nlk-h3' }, `检定（预设 ${presets().length} / 历史 ${history().length}）`),
+                h('section', { class: 'nlk-page-head' }, [h('div', { class: 'nlk-eyebrow' }, '作者测试工具'), h('h2', null, '试跑这张卡的检定'), h('p', null, `当前规则：${adapter.adapter.contract?.dice?.system === 'dnd' ? 'D20 难度制' : adapter.adapter.contract?.dice?.system === 'custom' ? '自定义' : 'COC 百分骰'}。这里的设置和预设不会展示给玩家。`)]),
+                h('div', { class: 'nlk-callout' }, '先用默认值试掷。觉得成功率不合适，再回“变量与规则 → 检定规则”调整，不需要理解底层表达式。'),
                 h('div', { class: 'nlk-row' }, [
-                    h('input', { class: 'nlk-contract-input', style: 'flex:1;', value: formula.value, onInput: (e) => { formula.value = e.target.value; }, placeholder: '骰子表达式（如 4d6kh3 / 1d100b1）' }),
-                    h('button', { class: 'nlk-btn', onClick: roll }, '掷骰'),
+                    h('input', { class: 'nlk-contract-input', style: 'flex:1;', value: formula.value, onInput: (e) => { formula.value = e.target.value; }, placeholder: '默认骰子' }),
+                    h('button', { class: 'nlk-btn nlk-btn-primary', onClick: roll }, '试掷一次'),
                 ]),
                 h('div', { class: 'nlk-row' }, [
                     h('input', { class: 'nlk-contract-input', style: 'width: 90px;', value: target.value, onInput: (e) => { target.value = e.target.value; }, placeholder: '目标值' }),
-                    h('button', { class: 'nlk-btn', onClick: checkRoll }, 'COC 检定'),
+                    h('button', { class: 'nlk-btn', onClick: checkRoll }, '按目标值检定'),
                 ]),
                 h('div', { class: 'nlk-row' }, [
                     h('input', { class: 'nlk-contract-input', style: 'flex:1;', value: suggestion.value, onInput: (e) => { suggestion.value = e.target.value; }, placeholder: '检定建议行（检定 <user> 侦查 难度=50 / 对抗 … / 必成 / 必败）' }),
                     h('button', { class: 'nlk-btn', onClick: runSuggestion }, '执行建议'),
                 ]),
                 lastResult.value ? h('pre', { class: 'nlk-pre' }, lastResult.value) : null,
-                h('div', { class: 'nlk-h3' }, '预设导入（AI 生成协议 nlkaleido_dice_preset_agent_v1）'),
-                h('textarea', { class: 'nlk-contract-input', rows: 4, value: presetText.value, onInput: (e) => { presetText.value = e.target.value; }, placeholder: '粘贴 AI 生成的预设 JSON（含 format/tests；tests 不通过拒绝导入）' }),
-                h('button', { class: 'nlk-btn', onClick: importPreset }, '导入预设（tests 校验）'),
+                h('details', { class: 'nlk-technical' }, [h('summary', null, `高级预设导入（已有 ${presets().length} 个）`), h('p', { class: 'nlk-hint' }, '仅供需要复杂成功等级、优势骰或自定义结果表的作者使用。普通卡可以完全忽略。'), h('textarea', { class: 'nlk-contract-input', rows: 4, value: presetText.value, onInput: (e) => { presetText.value = e.target.value; }, placeholder: '粘贴由 AI 帮帮生成的检定预设 JSON' }), h('button', { class: 'nlk-btn', onClick: importPreset }, '检查并导入预设')]),
                 h('div', { class: 'nlk-h3' }, `检定历史（最近 ${Math.min(history().length, 10)} 条）`),
                 h('div', { class: 'nlk-log' }, history().slice(0, 10).map((entry) => h('div', { class: 'nlk-log-row', key: entry.id }, [
                     h('span', null, `[${entry.kind}]`),
@@ -23909,11 +24197,16 @@ const ConfigView = defineComponent({
         const store = useNlStore();
         const adapter = useAdapter();
         const actionMessage = ref('');
+        const primaryTest = ref('');
+        const embeddingTest = ref('');
+        const saving = ref(false);
         const confirmReset = ref(false);
         const pendingTier = ref(null);
+        const cloneConfig = (value) => JSON.parse(JSON.stringify(value));
+        const draft = ref(cloneConfig(adapter.adapter.config));
         onMounted(() => {
             void adapter.loadConfig()
-                .then(() => { store.configVersionCount += 1; })
+                .then((loaded) => { draft.value = cloneConfig(loaded); store.configVersionCount += 1; })
                 .catch((error) => {
                 actionMessage.value = `配置加载失败：${error instanceof Error ? error.message : String(error)}`;
             });
@@ -23937,6 +24230,8 @@ const ConfigView = defineComponent({
             actionMessage.value = `正在切换到${TIER_LABEL[tier]}档并检查当前浏览器能力…`;
         };
         watch(() => store.configVersionCount, () => {
+            if (!saving.value)
+                draft.value = cloneConfig(adapter.adapter.config);
             if (!pendingTier.value)
                 return;
             const last = report();
@@ -23947,6 +24242,59 @@ const ConfigView = defineComponent({
                 : `切换失败：${last?.error ?? '未知错误'}`;
             pendingTier.value = null;
         });
+        const validateConnections = () => {
+            const ai = draft.value.primaryAi;
+            if (ai.mode === 'custom' && !ai.baseUrl.trim())
+                return '使用独立接口时，请填写主 AI 的 API URL。';
+            if (ai.mode === 'custom' && !ai.model.trim())
+                return '使用独立接口时，请填写主 AI 模型名。';
+            const vector = draft.value.embeddingApi;
+            if (vector.enabled && !vector.baseUrl.trim())
+                return '启用向量模型后，请填写向量 API URL。';
+            if (vector.enabled && !vector.model.trim())
+                return '启用向量模型后，请填写向量模型名。';
+            return null;
+        };
+        const saveConnections = async () => {
+            const invalid = validateConnections();
+            if (invalid) {
+                actionMessage.value = invalid;
+                return false;
+            }
+            saving.value = true;
+            try {
+                draft.value.retrieval = draft.value.embeddingApi.enabled ? 'vector' : 'bm25';
+                await adapter.saveConfig(cloneConfig(draft.value));
+                actionMessage.value = '模型与运行设置已保存。API Key 只保存在当前酒馆的扩展设置中。';
+                store.configVersionCount += 1;
+                return true;
+            }
+            catch (error) {
+                actionMessage.value = `保存失败：${error instanceof Error ? error.message : String(error)}`;
+                return false;
+            }
+            finally {
+                saving.value = false;
+            }
+        };
+        const testPrimary = async () => {
+            primaryTest.value = '正在连接…';
+            if (!await saveConnections()) {
+                primaryTest.value = '请先补全上方配置。';
+                return;
+            }
+            const result = await adapter.testPrimaryAiConnection();
+            primaryTest.value = `${result.ok ? '✅' : '❌'} ${result.message}`;
+        };
+        const testEmbedding = async () => {
+            embeddingTest.value = '正在连接…';
+            if (!await saveConnections()) {
+                embeddingTest.value = '请先补全上方配置。';
+                return;
+            }
+            const result = await adapter.testEmbeddingConnection();
+            embeddingTest.value = `${result.ok ? '✅' : '❌'} ${result.message}`;
+        };
         const rollback = () => {
             const result = dispatch({ action: 'configRollback' });
             actionMessage.value = result.ok ? '已提交快照回滚。' : result.error ?? '回滚失败';
@@ -23967,52 +24315,80 @@ const ConfigView = defineComponent({
             const last = report();
             const snap = snapshot();
             return h('div', { class: 'nlk-section' }, [
-                h('section', { class: 'nlk-page-head' }, [h('div', { class: 'nlk-eyebrow' }, '运行设置'), h('h2', null, '选择适合这张卡的运行方式'), h('p', null, '档位会调整记忆保存与检索能力，不会改变你已经定义的变量。点击后自动保存。')]),
-                h('div', { class: 'nlk-tier-grid' }, [
-                    ['minimal', 'standard', 'advanced'].map((tier) => h('button', {
-                        key: tier,
-                        class: current.tier === tier ? 'nlk-tier-card nlk-tier-active' : 'nlk-tier-card',
-                        onClick: () => applyTier(tier),
-                        disabled: pendingTier.value !== null,
-                    }, [
-                        h('span', { class: 'nlk-tier-icon' }, tier === 'minimal' ? '◇' : tier === 'standard' ? '◈' : '✦'),
-                        h('strong', null, tier === 'minimal' ? '极简' : tier === 'standard' ? '标准' : '进阶'),
-                        h('small', null, tier === 'minimal' ? '纯浏览器基础能力，最省心' : tier === 'standard' ? '更可靠的本地保存，推荐大多数卡' : '在可用时启用本地向量检索'),
-                        h('em', null, current.tier === tier ? '当前使用' : '点击切换'),
-                    ])),
+                h('section', { class: 'nlk-page-head' }, [h('div', { class: 'nlk-eyebrow' }, '模型与运行'), h('h2', null, '先连接 AI，再选择运行能力'), h('p', null, '主 AI 负责变量、世界推演、记忆整理和 AI 帮帮；向量模型完全可选，不配置也能正常运行。')]),
+                h('section', { class: 'nlk-setup-guide' }, [
+                    h('div', { class: 'nlk-setup-step nlk-setup-step-active' }, [h('b', null, '1'), h('span', null, [h('strong', null, '主 AI'), h('small', null, draft.value.primaryAi.mode === 'sillytavern' ? '复用酒馆连接' : draft.value.primaryAi.model || '待配置')])]),
+                    h('div', { class: 'nlk-setup-line' }),
+                    h('div', { class: 'nlk-setup-step' }, [h('b', null, '2'), h('span', null, [h('strong', null, '向量模型'), h('small', null, draft.value.embeddingApi.enabled ? draft.value.embeddingApi.model || '待配置' : '可选，当前关闭')])]),
+                    h('div', { class: 'nlk-setup-line' }),
+                    h('div', { class: 'nlk-setup-step' }, [h('b', null, '3'), h('span', null, [h('strong', null, '运行档位'), h('small', null, `当前${TIER_LABEL[current.tier] ?? current.tier}档`)])]),
                 ]),
-                h('article', { class: 'nlk-info-card' }, [
-                    h('div', { class: 'nlk-info-icon' }, '⇄'),
-                    h('div', null, [h('strong', null, '变量 Agent 用哪个 API？'), h('p', null, '直接使用酒馆当前“API 连接”中选定的模型和密钥，NLKaleido 不会再保存一份 Key。前端变量 API 也不需要网址或密钥；权限在作者页“前端 API”中逐变量开启。')]),
+                h('section', { class: 'nlk-model-card' }, [
+                    h('div', { class: 'nlk-model-card-head' }, [h('div', { class: 'nlk-info-icon' }, 'AI'), h('div', null, [h('strong', null, '主 AI · 必填'), h('p', null, '只配置这一套，就会供变量更新、世界风声、记忆整理和 AI 帮帮共同使用。')])]),
+                    h('div', { class: 'nlk-segmented' }, [
+                        h('button', { class: draft.value.primaryAi.mode === 'sillytavern' ? 'nlk-segmented-active' : '', onClick: () => { draft.value.primaryAi.mode = 'sillytavern'; } }, '复用酒馆当前连接'),
+                        h('button', { class: draft.value.primaryAi.mode === 'custom' ? 'nlk-segmented-active' : '', onClick: () => { draft.value.primaryAi.mode = 'custom'; } }, '使用独立 API'),
+                    ]),
+                    draft.value.primaryAi.mode === 'sillytavern'
+                        ? h('div', { class: 'nlk-callout' }, '无需重复填写 Key。万花筒会调用酒馆当前已连接的聊天模型；请先在酒馆 API 连接页确认模型可正常回复。')
+                        : h('div', { class: 'nlk-model-form' }, [
+                            h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, 'API URL'), h('input', { class: 'nlk-input', value: draft.value.primaryAi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.primaryAi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '填写到 /v1 即可，系统会自动请求 /chat/completions。接口需允许浏览器跨域访问。')]),
+                            h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '模型名'), h('input', { class: 'nlk-input', value: draft.value.primaryAi.model, placeholder: '例如 gpt-4.1-mini', onInput: (e) => { draft.value.primaryAi.model = e.target.value; } })]),
+                            h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'API Key'), h('input', { class: 'nlk-input', type: 'password', autocomplete: 'off', value: draft.value.primaryAi.apiKey, placeholder: '本地无鉴权接口可留空', onInput: (e) => { draft.value.primaryAi.apiKey = e.target.value; } })]),
+                        ]),
+                    h('div', { class: 'nlk-row' }, [h('button', { class: 'nlk-btn nlk-btn-primary', disabled: saving.value, onClick: () => { void saveConnections(); } }, saving.value ? '保存中…' : '保存设置'), h('button', { class: 'nlk-btn', disabled: saving.value, onClick: () => { void testPrimary(); } }, '测试主 AI')]),
+                    primaryTest.value ? h('div', { class: 'nlk-test-result' }, primaryTest.value) : null,
                 ]),
-                h('article', { class: 'nlk-info-card' }, [
-                    h('div', { class: 'nlk-info-icon' }, '◐'),
-                    h('div', null, [h('strong', null, '界面风格'), h('p', null, '只改变万花筒工作台的外观，不影响酒馆主题和角色卡。'), themePicker(store)]),
+                h('section', { class: draft.value.embeddingApi.enabled ? 'nlk-model-card nlk-model-card-enabled' : 'nlk-model-card' }, [
+                    h('div', { class: 'nlk-model-card-head' }, [h('div', { class: 'nlk-info-icon' }, 'V'), h('div', null, [h('strong', null, '向量模型 · 可选'), h('p', null, '只用于更精细的长期记忆检索。关闭时自动使用关键词检索，不会影响变量和世界书。')]), h('label', { class: 'nlk-switch-line' }, [h('input', { type: 'checkbox', checked: draft.value.embeddingApi.enabled, onChange: (e) => { draft.value.embeddingApi.enabled = e.target.checked; } }), draft.value.embeddingApi.enabled ? '已启用' : '未启用'])]),
+                    draft.value.embeddingApi.enabled ? h('div', { class: 'nlk-model-form' }, [
+                        h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, '向量 API URL'), h('input', { class: 'nlk-input', value: draft.value.embeddingApi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.embeddingApi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '系统会自动请求 /embeddings。')]),
+                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量模型名'), h('input', { class: 'nlk-input', value: draft.value.embeddingApi.model, placeholder: '例如 text-embedding-3-small', onInput: (e) => { draft.value.embeddingApi.model = e.target.value; } })]),
+                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'API Key'), h('input', { class: 'nlk-input', type: 'password', autocomplete: 'off', value: draft.value.embeddingApi.apiKey, placeholder: '本地无鉴权接口可留空', onInput: (e) => { draft.value.embeddingApi.apiKey = e.target.value; } })]),
+                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量维度'), h('input', { class: 'nlk-input', type: 'number', min: 1, max: 8192, value: draft.value.embeddingApi.dimensions ?? '', onInput: (e) => { draft.value.embeddingApi.dimensions = Number(e.target.value) || undefined; } }), h('small', { class: 'nlk-help' }, '不确定可留空，让服务自动决定。')]),
+                        h('div', { class: 'nlk-field nlk-vector-action' }, [h('button', { class: 'nlk-btn', disabled: saving.value, onClick: () => { void testEmbedding(); } }, '测试向量模型')]),
+                    ]) : null,
+                    embeddingTest.value ? h('div', { class: 'nlk-test-result' }, embeddingTest.value) : null,
                 ]),
-                h('div', { class: 'nlk-h3' }, `当前能力：${TIER_LABEL[current.tier] ?? current.tier}档 · ${current.storage === 'memory' ? '临时内存' : current.storage === 'indexeddb' ? '浏览器数据库' : '酒馆设置'} · ${current.retrieval === 'bm25' ? '关键词检索' : '向量检索'}`),
-                h('div', { class: 'nlk-row' }, [
-                    h('button', { class: 'nlk-btn', onClick: rollback, disabled: !snap }, '一键回滚快照'),
-                    h('button', { class: confirmReset.value ? 'nlk-btn nlk-danger' : 'nlk-btn', onClick: factoryReset }, confirmReset.value ? '确认恢复' : '恢复出厂设置'),
-                ]),
-                actionMessage.value ? h('div', { class: 'nlk-callout' }, actionMessage.value) : null,
-                snap
-                    ? h('div', { class: 'nlk-hint' }, `最近快照：${new Date(snap.takenAt).toLocaleString()}（原因：${snap.reason}）`)
-                    : h('div', { class: 'nlk-hint' }, '无配置快照（破坏性操作前自动创建）'),
-                last
-                    ? h('div', null, [
-                        last.ok ? null : h('div', { class: 'nlk-error' }, `配置失败：${last.error ?? ''}`),
-                        last.degradations.length ? h('div', null, last.degradations.map((d) => h('div', { class: 'nlk-hint' }, `降级：${d}`))) : null,
-                        last.warnings.length ? h('div', null, last.warnings.map((w) => h('div', { class: 'nlk-warn' }, `提示：${w}`))) : null,
-                        h('div', { class: 'nlk-h3' }, '连通性自检'),
-                        last.checks.map((check) => h('div', { class: 'nlk-log-row', key: check.id }, [
-                            h('span', { class: check.status === 'ok' ? 'nlk-on' : check.status === 'warn' ? 'nlk-warn' : 'nlk-error' }, check.status === 'ok' ? '●' : check.status === 'warn' ? '◐' : '✕'),
-                            h('span', null, check.name),
-                            h('span', { class: 'nlk-hint' }, check.message),
-                            check.fixAction ? h('span', { class: 'nlk-hint' }, `（修复：${check.fixAction}）`) : null,
+                h('details', { class: 'nlk-settings-fold' }, [h('summary', null, '运行档位与存储能力'),
+                    h('div', { class: 'nlk-tier-grid' }, [
+                        ['minimal', 'standard', 'advanced'].map((tier) => h('button', {
+                            key: tier,
+                            class: current.tier === tier ? 'nlk-tier-card nlk-tier-active' : 'nlk-tier-card',
+                            onClick: () => applyTier(tier),
+                            disabled: pendingTier.value !== null,
+                        }, [
+                            h('span', { class: 'nlk-tier-icon' }, tier === 'minimal' ? '◇' : tier === 'standard' ? '◈' : '✦'),
+                            h('strong', null, tier === 'minimal' ? '极简' : tier === 'standard' ? '标准' : '进阶'),
+                            h('small', null, tier === 'minimal' ? '纯浏览器基础能力，最省心' : tier === 'standard' ? '更可靠的本地保存，推荐大多数卡' : '在可用时启用本地向量检索'),
+                            h('em', null, current.tier === tier ? '当前使用' : '点击切换'),
                         ])),
-                    ])
-                    : h('div', { class: 'nlk-hint' }, '切换档位后，这里会说明浏览器实际启用了哪些能力。'),
-                h('div', { class: 'nlk-hint' }, '系统会自动限制记忆数量和注入长度，避免单次配置消耗过多资源。'),
+                    ]),
+                    h('div', { class: 'nlk-h3' }, `当前能力：${TIER_LABEL[current.tier] ?? current.tier}档 · ${current.storage === 'memory' ? '临时内存' : current.storage === 'indexeddb' ? '浏览器数据库' : '酒馆设置'} · ${current.retrieval === 'bm25' ? '关键词检索' : '向量检索'}`),
+                    h('div', { class: 'nlk-row' }, [
+                        h('button', { class: 'nlk-btn', onClick: rollback, disabled: !snap }, '一键回滚快照'),
+                        h('button', { class: confirmReset.value ? 'nlk-btn nlk-danger' : 'nlk-btn', onClick: factoryReset }, confirmReset.value ? '确认恢复' : '恢复出厂设置'),
+                    ]),
+                    actionMessage.value ? h('div', { class: 'nlk-callout' }, actionMessage.value) : null,
+                    snap
+                        ? h('div', { class: 'nlk-hint' }, `最近快照：${new Date(snap.takenAt).toLocaleString()}（原因：${snap.reason}）`)
+                        : h('div', { class: 'nlk-hint' }, '无配置快照（破坏性操作前自动创建）'),
+                    last
+                        ? h('div', null, [
+                            last.ok ? null : h('div', { class: 'nlk-error' }, `配置失败：${last.error ?? ''}`),
+                            last.degradations.length ? h('div', null, last.degradations.map((d) => h('div', { class: 'nlk-hint' }, `降级：${d}`))) : null,
+                            last.warnings.length ? h('div', null, last.warnings.map((w) => h('div', { class: 'nlk-warn' }, `提示：${w}`))) : null,
+                            h('div', { class: 'nlk-h3' }, '连通性自检'),
+                            last.checks.map((check) => h('div', { class: 'nlk-log-row', key: check.id }, [
+                                h('span', { class: check.status === 'ok' ? 'nlk-on' : check.status === 'warn' ? 'nlk-warn' : 'nlk-error' }, check.status === 'ok' ? '●' : check.status === 'warn' ? '◐' : '✕'),
+                                h('span', null, check.name),
+                                h('span', { class: 'nlk-hint' }, check.message),
+                                check.fixAction ? h('span', { class: 'nlk-hint' }, `（修复：${check.fixAction}）`) : null,
+                            ])),
+                        ])
+                        : h('div', { class: 'nlk-hint' }, '切换档位后，这里会说明浏览器实际启用了哪些能力。'),
+                    h('div', { class: 'nlk-hint' }, '系统会自动限制记忆数量和注入长度，避免单次配置消耗过多资源。')]),
+                h('details', { class: 'nlk-settings-fold' }, [h('summary', null, '界面外观'), h('p', { class: 'nlk-hint' }, '只改变万花筒工作台，不影响酒馆主题和角色卡。'), themePicker(store)]),
             ]);
         };
     },
@@ -24032,15 +24408,27 @@ function themePicker(store, compact = false) {
         onClick: () => store.setTheme(item.key),
     }, compact ? item.icon : `${item.icon} ${item.label}`)));
 }
+function themeCycleButton(store) {
+    const current = THEME_OPTIONS.find((item) => item.key === store.theme) ?? THEME_OPTIONS[0];
+    const cycle = () => {
+        const index = THEME_OPTIONS.findIndex((item) => item.key === store.theme);
+        store.setTheme(THEME_OPTIONS[(index + 1) % THEME_OPTIONS.length].key);
+    };
+    return h('button', { class: 'nlk-theme-cycle', title: '点击切换界面风格', 'aria-label': `当前${current.label}风格，点击切换`, onClick: cycle }, `${current.icon} ${current.label}`);
+}
 /** 首屏身份分流：玩家直接看状态，作者进入配置向导。 */
 const RoleChooser = defineComponent({
     name: 'NlRoleChooser',
     setup() {
         const store = useNlStore();
+        const adapter = useAdapter();
+        const aiMode = ref(adapter.adapter.config.primaryAi.mode);
+        onMounted(() => { void adapter.loadConfig().then((config) => { aiMode.value = config.primaryAi.mode; }); });
         const choose = (role) => {
             store.roleMode = role;
             store.authorMode = role === 'author';
             store.activeTab = role;
+            scrollWorkbenchTop();
         };
         return () => h('section', { class: 'nlk-role-gate' }, [
             h('div', { class: 'nlk-role-intro' }, [
@@ -24048,7 +24436,12 @@ const RoleChooser = defineComponent({
                 h('div', { class: 'nlk-eyebrow' }, '欢迎使用万花筒'),
                 h('h1', null, '你准备以什么身份进入？'),
                 h('p', null, '玩家只看到角色和世界状态；作者负责定义要追踪的变量、更新方式与可选功能。之后可随时切换。'),
-                themePicker(store),
+                themeCycleButton(store),
+            ]),
+            h('div', { class: 'nlk-onboarding-strip' }, [
+                h('span', { class: 'nlk-onboarding-number' }, '1'),
+                h('div', null, [h('strong', null, '初次使用：先确认 AI 连接'), h('small', null, aiMode.value === 'custom' ? '当前使用独立 API，可进入“模型与运行”检查 URL、模型和 Key。' : '当前复用酒馆模型；也可以改成独立 API。')]),
+                h('button', { class: 'nlk-btn', onClick: () => { store.roleMode = 'author'; store.authorMode = true; store.activeTab = 'config'; scrollWorkbenchTop(); } }, '去配置 →'),
             ]),
             h('div', { class: 'nlk-role-grid' }, [
                 h('button', { class: 'nlk-role-card nlk-role-player', onClick: () => choose('player') }, [
@@ -24075,6 +24468,7 @@ const PanelRoot = defineComponent({
             onClick: () => {
                 store.activeTab = name;
                 store.authorMode = name === 'author';
+                scrollWorkbenchTop();
             },
         }, [h('span', { class: 'nlk-nav-icon' }, icon), h('span', null, label)]);
         const page = () => store.activeTab === 'author'
@@ -24094,9 +24488,9 @@ const PanelRoot = defineComponent({
                 h('aside', { class: 'nlk-sidebar' }, [
                     h('div', { class: 'nlk-brand' }, [h('span', { class: 'nlk-brand-mark' }, '◇'), h('div', null, [h('strong', null, '万花筒'), h('small', null, 'NLKaleido')])]),
                     h('div', { class: 'nlk-role-current' }, [h('span', null, store.roleMode === 'author' ? '✦ 作者模式' : '⌂ 玩家模式'), h('button', { onClick: () => { store.roleMode = 'choose'; } }, '切换')]),
-                    themePicker(store, true),
+                    themeCycleButton(store),
                     store.roleMode === 'player'
-                        ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '我的游戏'), tab('player', '⌂', '角色状态'), tab('memory', '◉', '故事记忆'), tab('plot', '⌁', '世界进展'), tab('dice', '⬡', '掷骰与检定')])
+                        ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '我的游戏'), tab('player', '⌂', '变量概览'), tab('memory', '◉', '故事记忆'), tab('plot', '⌁', '世界进展'), tab('dice', '⬡', '进行检定')])
                         : h('div', { class: 'nlk-nav-group' }, [h('small', null, '创作流程'), tab('author', '✦', '变量与规则'), tab('player', '◫', '玩家页面预览')]),
                     store.roleMode === 'author' ? h('div', { class: 'nlk-nav-group' }, [h('small', null, '作者工具'), tab('memory', '◉', '记忆数据'), tab('plot', '⌁', '世界推演'), tab('dice', '⬡', '检定测试'), tab('config', '⚙', '运行设置'), tab('migration', '⇄', '导入 MVU 老卡')]) : null,
                     h('div', { class: 'nlk-sidebar-foot' }, [h('span', { class: 'nlk-health-dot' }), `轮次 ${store.lastTurnId} · ${store.pending.length} 待复核`]),
@@ -24336,6 +24730,86 @@ const CSS = `
 .nlk-feature-empty { min-height: 430px; padding: 28px; display: grid; place-content: center; justify-items: center; text-align: center; }
 .nlk-feature-empty h2 { margin: 10px 0 3px; color: var(--nlk-title); }
 .nlk-feature-empty p { max-width: 430px; margin: 0 0 16px; color: var(--nlk-muted); }
+.nlk-theme-cycle { margin: 0 7px; min-height: 27px; padding: 3px 8px; align-self: flex-start; color: var(--nlk-muted); border: 1px solid var(--nlk-border); border-radius: 99px; background: var(--nlk-surface); cursor: pointer; font-size: 10px; }
+.nlk-theme-cycle:hover { color: var(--nlk-title); border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-role-intro .nlk-theme-cycle { margin: 13px auto 0; }
+.nlk-onboarding-strip { width: min(760px,88vw); box-sizing: border-box; padding: 11px 13px; display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 11px; border: 1px solid color-mix(in srgb,var(--nlk-accent) 26%,var(--nlk-border)); border-radius: 12px; background: var(--nlk-accent-soft); }
+.nlk-onboarding-strip strong, .nlk-onboarding-strip small { display: block; }
+.nlk-onboarding-strip small { margin-top: 2px; color: var(--nlk-muted); }
+.nlk-onboarding-number { width: 26px; height: 26px; display: grid; place-items: center; color: #fff; border-radius: 50%; background: var(--nlk-accent); font-weight: 800; }
+.nlk-setup-guide { margin: 13px 0; padding: 12px 15px; display: flex; align-items: center; border: 1px solid var(--nlk-border); border-radius: 12px; background: var(--nlk-surface); }
+.nlk-setup-step { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--nlk-muted); }
+.nlk-setup-step b { flex: 0 0 auto; width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--nlk-border); border-radius: 50%; }
+.nlk-setup-step strong, .nlk-setup-step small { display: block; white-space: nowrap; }
+.nlk-setup-step small { font-size: 9px; }
+.nlk-setup-step-active { color: var(--nlk-title); }
+.nlk-setup-step-active b { color: #fff; border-color: var(--nlk-accent); background: var(--nlk-accent); }
+.nlk-setup-line { flex: 1; min-width: 20px; height: 1px; margin: 0 12px; background: var(--nlk-border); }
+.nlk-model-card { margin: 11px 0; padding: 15px 17px; border: 1px solid var(--nlk-border); border-radius: 13px; background: var(--nlk-surface); }
+.nlk-model-card-enabled { border-color: color-mix(in srgb,var(--nlk-accent) 38%,var(--nlk-border)); }
+.nlk-model-card-head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 11px; }
+.nlk-model-card-head p { margin: 2px 0 0; color: var(--nlk-muted); }
+.nlk-model-form { margin-top: 12px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px 12px; }
+.nlk-vector-action { justify-content: flex-end; }
+.nlk-vector-action .nlk-btn { margin-top: auto; }
+.nlk-test-result { margin-top: 8px; padding: 7px 9px; color: var(--nlk-text); border-radius: 7px; background: var(--nlk-input-bg); overflow-wrap: anywhere; }
+.nlk-settings-fold { margin: 12px 0; padding: 11px 13px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
+.nlk-settings-fold > summary { color: var(--nlk-title); font-weight: 700; cursor: pointer; }
+.nlk-ai-helper { margin-bottom: 14px; padding: 14px; border: 1px solid color-mix(in srgb,var(--nlk-accent) 34%,var(--nlk-border)); border-radius: 13px; background: linear-gradient(125deg,var(--nlk-accent-soft),var(--nlk-surface)); }
+.nlk-ai-helper-head { display: flex; align-items: center; gap: 10px; }
+.nlk-ai-helper-head strong, .nlk-ai-helper-head small { display: block; }
+.nlk-ai-helper-head small { color: var(--nlk-muted); }
+.nlk-ai-orb { width: 34px; height: 34px; display: grid; place-items: center; color: #fff; border-radius: 11px; background: linear-gradient(135deg,var(--nlk-accent),#2b9bb1); box-shadow: 0 0 18px var(--nlk-accent-soft); }
+.nlk-ai-quick { display: flex; gap: 6px; margin: 11px 0 7px; overflow-x: auto; }
+.nlk-ai-chip { flex: 0 0 auto; padding: 5px 9px; color: var(--nlk-text); border: 1px solid var(--nlk-border); border-radius: 99px; background: var(--nlk-surface); cursor: pointer; font-size: 10px; }
+.nlk-ai-chip:hover { border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-ai-prompt { min-height: 80px; }
+.nlk-ai-helper-foot { margin-top: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.nlk-ai-helper-foot span { color: var(--nlk-muted); font-size: 10px; }
+.nlk-lore-browser { margin: 10px 0; padding: 13px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
+.nlk-lore-browser > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.nlk-lore-browser > div:first-child strong, .nlk-lore-browser > div:first-child small { display: block; }
+.nlk-lore-browser > div:first-child small { color: var(--nlk-muted); }
+.nlk-lore-book { margin-top: 8px; border: 1px solid var(--nlk-border); border-radius: 9px; overflow: hidden; }
+.nlk-lore-book > summary { padding: 8px 10px; color: var(--nlk-title); background: var(--nlk-input-bg); cursor: pointer; }
+.nlk-lore-entry-list { max-height: 230px; overflow: auto; }
+.nlk-lore-entry { padding: 8px 10px; display: grid; grid-template-columns: minmax(130px,.55fr) minmax(0,1.45fr); gap: 10px; border-top: 1px solid var(--nlk-border); }
+.nlk-lore-entry strong { color: var(--nlk-title); }
+.nlk-lore-entry small { color: var(--nlk-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nlk-dice-system-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; margin: 10px 0 14px; }
+.nlk-dice-system { min-height: 88px; padding: 10px; color: var(--nlk-text); text-align: left; border: 1px solid var(--nlk-border); border-radius: 10px; background: var(--nlk-surface); cursor: pointer; }
+.nlk-dice-system strong, .nlk-dice-system small { display: block; }
+.nlk-dice-system small { margin-top: 4px; color: var(--nlk-muted); }
+.nlk-dice-system-active { border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
+.nlk-variable-value { display: flex; align-items: center; justify-content: flex-end; gap: 7px; min-width: 0; }
+.nlk-variable-value strong { overflow-wrap: anywhere; }
+.nlk-type-badge { flex: 0 0 auto; padding: 1px 5px; color: var(--nlk-muted); border: 1px solid var(--nlk-border); border-radius: 99px; font: 9px/1.5 ui-monospace,monospace; }
+.nlk-number-value { color: var(--nlk-title); font-size: 18px; }
+.nlk-bool-pill { padding: 3px 7px; color: var(--nlk-muted); border-radius: 99px; background: var(--nlk-input-bg); font-size: 10px; }
+.nlk-bool-on { color: #176e49; background: #dff5e9; }
+.nlk-theme-midnight .nlk-bool-on, .nlk-theme-system .nlk-bool-on { color: #83e7b4; background: rgba(61,186,126,.14); }
+.nlk-value-chips { display: flex; justify-content: flex-end; gap: 4px; flex-wrap: wrap; }
+.nlk-value-chips span { padding: 2px 6px; color: var(--nlk-text); border-radius: 6px; background: var(--nlk-input-bg); font-size: 10px; }
+.nlk-value-pairs { min-width: 150px; display: grid; gap: 3px; }
+.nlk-value-pairs span { display: flex; justify-content: space-between; gap: 10px; }
+.nlk-value-pairs b { color: var(--nlk-muted); font-weight: 500; }
+.nlk-value-pairs em { color: var(--nlk-title); font-style: normal; overflow-wrap: anywhere; }
+.nlk-player-dice { min-height: 300px; display: grid; place-content: center; justify-items: center; text-align: center; border: 1px solid var(--nlk-border); border-radius: 15px; background: radial-gradient(circle at 50% 40%,var(--nlk-accent-soft),var(--nlk-surface)); }
+.nlk-player-dice-mark { width: 68px; height: 68px; display: grid; place-items: center; color: #fff; border-radius: 20px; background: linear-gradient(145deg,var(--nlk-accent),#2c8ba7); font-size: 32px; box-shadow: 0 10px 35px var(--nlk-accent-soft); }
+.nlk-player-dice strong { margin-top: 14px; color: var(--nlk-title); font-size: 19px; }
+.nlk-player-dice p { max-width: 360px; margin: 4px 0 15px; color: var(--nlk-muted); }
+.nlk-dice-result { margin-top: 12px; padding: 15px; color: var(--nlk-title); border: 1px solid color-mix(in srgb,var(--nlk-accent) 38%,var(--nlk-border)); border-radius: 11px; background: var(--nlk-accent-soft); text-align: center; font-weight: 700; overflow-wrap: anywhere; }
+/* 所有主题的文字都从主题变量取色，避免酒馆全局 --white 等变量污染亮色模式。 */
+.nlk-root, .nlk-role-gate, .nlk-brand, .nlk-role-current, .nlk-nav-group, .nlk-sidebar-foot, .nlk-system-card, .nlk-check-explain { color: var(--nlk-text); }
+.nlk-shell strong, .nlk-shell h1, .nlk-shell h2, .nlk-shell h3, .nlk-shell summary { color: var(--nlk-title); }
+.nlk-role-current { color: var(--nlk-text); border-color: var(--nlk-border); background: var(--nlk-accent-soft); }
+.nlk-brand-mark, .nlk-eyebrow, .nlk-role-card em { color: var(--nlk-accent); }
+.nlk-nav-group > small, .nlk-brand small, .nlk-system-card p, .nlk-check-explain small, .nlk-card-title small, .nlk-kpi span, .nlk-status-row span { color: var(--nlk-muted); opacity: 1; }
+.nlk-shell select option { color: var(--nlk-text); background: var(--nlk-surface-strong); }
+.nlk-theme-light .nlk-nav-active, .nlk-theme-light .nlk-field-item-active { color: #49359e; }
+.nlk-theme-light .nlk-health { color: #176e49; background: #dff5e9; }
+.nlk-theme-light .nlk-toast-ok { color: #176e49; background: #e0f5e9; }
+.nlk-theme-light .nlk-toast-error, .nlk-theme-light .nlk-danger { color: #a92d41; }
 @media (max-width: 700px) {
   .nlkaleido-float-status { top: calc(100dvh - 48px); right: 8px; bottom: auto; }
   .nlkaleido-workbench { padding: 0; }
@@ -24355,6 +24829,13 @@ const CSS = `
   .nlk-builder-pair { grid-template-columns: 1fr 18px 1fr 27px; }
   .nlk-subnavs { width: 100%; overflow-x: auto; }
   .nlk-subnav { flex: 0 0 auto; }
+  .nlk-onboarding-strip { width: 100%; grid-template-columns: auto 1fr; }
+  .nlk-onboarding-strip .nlk-btn { grid-column: 1 / -1; width: 100%; }
+  .nlk-setup-guide { align-items: flex-start; flex-direction: column; }
+  .nlk-setup-line { width: 1px; height: 12px; min-width: 1px; margin: 2px 12px; }
+  .nlk-model-form, .nlk-lore-entry { grid-template-columns: 1fr; }
+  .nlk-dice-system-grid { grid-template-columns: 1fr; }
+  .nlk-ai-helper-foot { align-items: stretch; flex-direction: column; }
 }
 `;
 /**
@@ -24598,7 +25079,7 @@ let adapter = null;
 let startupState = 'idle';
 let startupError = null;
 let previousChatId = null;
-const VERSION = '0.6.1';
+const VERSION = '0.7.0';
 /** 稳定 API 入口（每次取新鲜引用：chatMetadata 在切聊天后引用会变，文档警告不可长持） */
 function getStContext() {
     const globalObject = globalThis;

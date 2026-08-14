@@ -16,7 +16,7 @@ const TIER_NAMES = Object.freeze({
     standard: '标准模式',
     advanced: '进阶模式',
 });
-const CONFIG_VERSION = 1;
+const CONFIG_VERSION = 2;
 /** 档位 → 默认配置（§20.13.4 表） */
 function tierDefaults(tier, storage) {
     const base = {
@@ -33,6 +33,12 @@ function tierDefaults(tier, storage) {
         resources: {
             maxVectorDims: 1024,
             maxMemoryTokens: tier === 'minimal' ? 800 : 1500,
+        },
+        primaryAi: {
+            mode: 'sillytavern', baseUrl: '', apiKey: '', model: '', timeoutMs: 60_000,
+        },
+        embeddingApi: {
+            enabled: false, baseUrl: '', apiKey: '', model: '', dimensions: 1024,
         },
     };
     return base;
@@ -95,15 +101,14 @@ function decideTier(probe, preferred = 'standard') {
         }
         else {
             retrieval = 'bm25';
-            tier = 'standard';
-            degradations.push(probe.webllm === 'timeout' ? 'webllm 超时（5s）→ 降级 BM25' : 'webllm 未就绪 → 降级 BM25（纯 JS，功能不受影响）');
+            degradations.push(probe.webllm === 'timeout' ? '本地向量组件超时 → 暂用关键词检索' : '尚未配置向量模型 → 暂用关键词检索（进阶设置仍然保留）');
         }
     }
     else {
         degradations.push('标准/极简档：检索固定 BM25（纯 JS 零依赖）');
     }
     if (tier === 'advanced' && retrieval !== 'vector') {
-        warnings.push('进阶模式需要向量后端；当前降级为 BM25 + 标准档');
+        warnings.push('进阶设置已开启；填写可选向量模型后可启用语义检索，目前使用关键词检索');
     }
     if (probe.bridges.length) {
         warnings.push(`检测到可选桥接：${probe.bridges.join('、')}（需高级配置）`);
@@ -112,7 +117,9 @@ function decideTier(probe, preferred = 'standard') {
         // 无高级后端 → 纯 JS 默认路径，功能不缺失只降级高级特性
         degradations.push('无任何高级后端 → 纯 JS 默认路径（功能不缺失，仅降级高级特性）');
     }
-    return { tier, config: tierDefaults(tier, storage), degradations, warnings };
+    const config = tierDefaults(tier, storage);
+    config.retrieval = retrieval;
+    return { tier, config, degradations, warnings };
 }
 /** 配置后自动自检（存储读写 / 检索 / 注入各跑一次） */
 function runSelfCheck(config, env) {
@@ -162,8 +169,18 @@ function runSelfCheck(config, env) {
     }
     return items;
 }
+/** v1 → v2：补充双模型端点；旧用户继续复用酒馆 API，不要求重新填写。 */
+const migrateConfigV1ToV2 = (old) => ({
+    ...old,
+    primaryAi: {
+        mode: 'sillytavern', baseUrl: '', apiKey: '', model: '', timeoutMs: 60_000,
+    },
+    embeddingApi: {
+        enabled: false, baseUrl: '', apiKey: '', model: '', dimensions: 1024,
+    },
+});
 /** 配置版本迁移：configVersion 落后 → 逐版本链式迁移（对齐 contractVersion 模式） */
-function migrateConfig(stored, migrations, targetVersion = CONFIG_VERSION) {
+function migrateConfig(stored, migrations = [migrateConfigV1ToV2], targetVersion = CONFIG_VERSION) {
     if (!stored || typeof stored !== 'object')
         return { config: null, migrated: false, errors: ['配置缺失或损坏（恢复默认）'] };
     const record = { ...stored };
@@ -189,7 +206,19 @@ function migrateConfig(stored, migrations, targetVersion = CONFIG_VERSION) {
     }
     record.configVersion = version;
     const tier = ['minimal', 'standard', 'advanced'].includes(record.tier) ? record.tier : 'minimal';
-    return { config: { ...tierDefaults(tier), ...record }, migrated, errors };
+    const defaults = tierDefaults(tier);
+    return {
+        config: {
+            ...defaults,
+            ...record,
+            memory: { ...defaults.memory, ...(record.memory ?? {}) },
+            resources: { ...defaults.resources, ...(record.resources ?? {}) },
+            primaryAi: { ...defaults.primaryAi, ...(record.primaryAi ?? {}) },
+            embeddingApi: { ...defaults.embeddingApi, ...(record.embeddingApi ?? {}) },
+        },
+        migrated,
+        errors,
+    };
 }
 /** 配置快照（破坏性操作前自动调用） */
 function takeSnapshot(config, reason, now = Date.now()) {
@@ -245,4 +274,4 @@ function dryRunConfig(candidate, env) {
     return { ok: errors.length === 0 || errors.every((e) => e.startsWith('资源钳制')), errors };
 }
 
-export { CONFIG_VERSION, RESOURCE_LIMITS, TIER_NAMES, applyOverrides, clampConfig, decideTier, dryRunConfig, isDestructiveAction, migrateConfig, probeEnvironment, runSelfCheck, takeSnapshot, tierDefaults };
+export { CONFIG_VERSION, RESOURCE_LIMITS, TIER_NAMES, applyOverrides, clampConfig, decideTier, dryRunConfig, isDestructiveAction, migrateConfig, migrateConfigV1ToV2, probeEnvironment, runSelfCheck, takeSnapshot, tierDefaults };
