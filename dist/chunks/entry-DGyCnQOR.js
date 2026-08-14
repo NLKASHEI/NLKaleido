@@ -1,19 +1,18 @@
 /**
  * hash64 —— 64 位双通道混合哈希（§7 G2）。
- * 算法以《研究代码.txt》第 4 行原文 `q()` 为准（2026-08-14 直接核对）：
- * - 双种子：0xDEADBEEF ^ len（t）、0x41C6CE57 ^ len（n）——原文十进制 1103547991；
- *   ⚠️ 还原文档写 0x41C64E6D 系转写错误，已按原文改正；
+ * 算法：
+ * - 双种子：0xDEADBEEF ^ len（t）、0x41C6CE57 ^ len（n）；
  * - 循环：imul(t ^ ch, 0x9E3779B1) / imul(n ^ ch, 0x5F356495)（32 位乘法）；
  * - 雪崩：0x85EBCA6B / 0xC2B2AE35 交叉混合（t 先更新，n 用新 t）；
  * - 输出 `${n}${t}` 各 8 位 hex（16 位）。
- * 黄金向量（原文 q() 实测）：'' → 488bdcb81aee8d83；'abc' → 9bd099588f6f1534（单测锁定）。
+ * 黄金向量（逐位锁定）：'' → 488bdcb81aee8d83；'abc' → 9bd099588f6f1534。
  * 纯 TS、同步、无 crypto 依赖（浏览器端可用）。
  *
  * 【实现决策】KaleidoState.revision.hash（§7 声明 sha256）在浏览器同步路径下改走 hash64；
  * 需要密码学强度时（P2 checkpoint 校验）由存储层用 Web Crypto `crypto.subtle.digest('SHA-256')`
  * （异步）另行计算。
  */
-/** 64 位双通道混合哈希（研究代码.txt 行 4 原文 q() 逐位复刻） */
+/** 64 位双通道混合哈希（黄金向量见文件头） */
 function hash64(text) {
     const input = String(text ?? '');
     let t = (0xdeadbeef ^ input.length) >>> 0;
@@ -260,11 +259,11 @@ function dueFields(meta, c, turnId) {
     return due;
 }
 /**
- * Fast Demote（CFS real_takeover.js:320-331）：stable 字段本轮值变了 → 立即降 volatile
+ * Fast Demote：stable 字段本轮值变了 → 立即降 volatile
  * （值改为进 L3 delta 暴露真实新值，而非 L1 STABLE_BATCH 引用）。
  * thrash lock（默认 3 次）：同一字段反复降级达阈值 → 永久 volatile（抖动锁定）。
- * 返回 { demoted, locked }。Slow Promote 不做自动（CFS 有，万花筒保留人工：
- * learnFieldPools 建议 + 面板一键采纳——contractVersion+1 才改前缀，防止意外击穿缓存）。
+ * 返回 { demoted, locked }。Slow Promote 不做自动，保留人工：
+ * learnFieldPools 建议 + 面板一键采纳——contractVersion+1 才改前缀，防止意外击穿缓存。
  */
 function stabilityDemotion(contract, changedPaths, demoteCounts, thrashLock = 3) {
     const demoted = [];
@@ -960,10 +959,8 @@ function buildPrefixSegments(c, state, due, opts = {}) {
     return { segments, fingerprint };
 }
 /**
- * 最近剧情 squash（G7，§5.1/还原文档 §5）：取最近 N 条 → 全列表相邻同发件人消息合并 → 去重。
- * 目的：L3 尾部长度受控、前缀字节稳定。
- * （梦鲸审计修正：squash_nearby 不包裹 <observed_piece>——包裹仅 squash_into_one 的 g+y 段；
- * 此处对齐 squash_nearby 语义：纯合并。）
+ * 最近剧情 squash（G7，§5.1/§5.4）：取最近 N 条 → 全列表相邻同发件人消息合并 → 去重。
+ * 目的：L3 尾部长度受控、前缀字节稳定。语义 = 纯相邻合并（不引入包裹标记）。
  */
 function squashRecentStory(messages, maxMessages = 12) {
     const recent = messages.slice(-maxMessages * 3); // 取 3 倍窗口供合并
@@ -989,15 +986,15 @@ function squashRecentStory(messages, maxMessages = 12) {
 function buildTail(input) {
     const { contract, state, due, observation, activeEntries, recentStory, userInput, budget } = input;
     const lines = [];
-    // 0. Full Refresh 全量快照校准（CFS 审计项 8：每 K 轮把当前全量数据塞一份做完整快照，防长会话漂移）
+    // 0. Full Refresh 全量快照校准（§5.4 审计项 8：每 K 轮把当前全量数据塞一份做完整快照，防长会话漂移）
     if (input.fullRefresh) {
         lines.push('<!-- NLKaleido Full Refresh: 全量 stat_data 快照（周期校准） -->');
         lines.push('```json');
         lines.push(JSON.stringify(state.stat_data));
         lines.push('```');
     }
-    // 1. 静态值快照区（§5.4/CFS 审计修正）：static+stable 字段的值**恒**呈现（fixed 永不到期，
-    //    若只按 due 命中呈现 Agent 将永远看不到它们；CFS 同义语义 = stable 值按 schema 理解）。
+    // 1. 静态值快照区（§5.4）：static+stable 字段的值**恒**呈现（fixed 永不到期，
+    //    若只按 due 命中呈现 Agent 将永远看不到它们）。
     //    值未变 → 行字节恒定（前缀稳定）；值变 → 仅该行更新。
     const staticFields = Object.values(contract.updateRules).filter((f) => fieldSlot(f) === 'l1_ref');
     if (staticFields.length) {
@@ -1007,7 +1004,7 @@ function buildTail(input) {
             lines.push(value === undefined ? `${field.path}: (未设置)` : `${field.path}: ${JSON.stringify(value)}`);
         }
     }
-    // 2. 观察层字段（动态池增量；stable 本轮变化 → 此处暴露真实新值，CFS present→delta 语义）
+    // 2. 观察层字段（动态池增量；stable 本轮变化 → 此处暴露真实新值）
     const fields = observation?.fields ?? due.map((path) => ({
         path,
         value: hasAtPath(state.stat_data, path) ? getAtPath(state.stat_data, path) : undefined,
@@ -1237,7 +1234,7 @@ function validateOps(c, state, ops, turnId, opts = {}) {
                     rejected.push({ op, reason: 'delta 要求当前值为有限数值' });
                     continue;
                 }
-                // 浮点卫生（MVU 教训 update_variables.ts:144/1353：toPrecision(12) 防累积误差）
+                // 浮点卫生：toPrecision(12) 防累积误差
                 const next = Number((oldValue + op.value).toPrecision(12));
                 const rangeError = checkRange(field, next);
                 if (rangeError) {
@@ -1696,7 +1693,7 @@ function shouldCheckpoint(state, now, config = DEFAULT_CHANGELOG_CONFIG) {
     const sizeKB = logSizeKB(state);
     return rounds >= config.checkpointInterval || hours >= config.checkpointIntervalHours || sizeKB >= config.checkpointLogSizeKB;
 }
-/** 建立 full checkpoint（stat_data + meta 完整快照，§4.4.1 checkpointFull；shujuku 审计修正） */
+/** 建立 full checkpoint（stat_data + meta 完整快照，§4.4.1 checkpointFull） */
 function makeCheckpoint(state, reason, now = Date.now()) {
     state.checkpoints.push({
         seq: state.revision.seq,
@@ -1803,7 +1800,7 @@ function writeValue(state, path, value) {
 }
 
 /**
- * 白名单谓词（§17.8 PredicateExpr + §17.14-S2 文本谓词；语义对齐 ACU seed-condition.ts）。
+ * 白名单谓词（§17.8 PredicateExpr + §17.14-S2 文本谓词：大小写不敏感子串）。
  *
  * - AST 形式（非文本 DSL）：{ var, op, value } | { source, contains } | { and } | { or } | { not }。
  * - 强类型断言（§17.4）：数值比较两端必须同类型，跨类型判 false；文本 contains 大小写不敏感
@@ -1901,21 +1898,20 @@ function evaluateEjs(c, state, sources) {
 /**
  * M13 记忆系统核心（§20，作者可选、默认关闭；纯 JS 零依赖）。
  *
- * 三源对照（详见《记忆系统_百家之长启示.md》与交接稿 §20.1）：
- * - livingmemory（astrbot_plugin_livingmemory，memory_atom.py / memory_engine.py / bm25_retriever.py）：
- *   记忆原子（五类型 + TTL + 三种衰减 + 访问强化 + 遗忘状态机）、反思写入、BM25 零向量检索、
- *   注入策略（system_prompt 注入破坏前缀缓存 → 万花筒废弃，只进 L3「记忆段」）。
- * - shujuku（ACU）：近/远两层记忆（近 = changelog 本地 append；远 = 达阈值批量归档）、
- *   纯 TS BM25（bigram 分词 + k1=1.5）、按楼层增量快照、纪要注入模板 `<记忆回溯>`。
- * - yuzuki-Memory：结构化记忆表（列定义 + 行记录）、楼层作用域。
+ * 能力面（详见交接稿 §20.1-§20.9）：
+ * - 记忆原子（五类型 + TTL + 三种衰减 + 访问强化 + 遗忘状态机）；
+ * - 反思写入（合并进变量请求，不新增请求）；BM25 零向量检索（bigram 分词 + k1=1.5/b=0.75）；
+ * - 注入只进 L3「记忆段」（system 前缀注入破坏前缀缓存 → 废弃）；
+ * - 近/远两层记忆（近 = changelog 本地 append；远 = 达阈值批量归档 + 按楼层快照）；
+ * - 结构化记忆表（列定义 + 行记录 + 楼层作用域）、实体关系图、检索注册点（M13f）。
  *
  * 本模块只做纯逻辑（可单测）；IO（StorageProvider 持久化 / Scheduler 调度 / L3 注入挂点 /
  * Agent 工具注册）由 adapter 与 §18 扩展架构接线。默认关闭时本模块代码不被执行（§21.6 零开销）。
  */
 // ============================================================
-// §20.2 常量：五类型基础 TTL 与衰减曲线（livingmemory 蒸馏）
+// §20.2 常量：五类型基础 TTL 与衰减曲线
 // ============================================================
-/** 基础 TTL（天），按类型（livingmemory memory_atom.py 蒸馏：情景 7 / 计划 2 / 事实 180 / 关系 90 / 偏好 60 / 未知 30） */
+/** 基础 TTL（天），按类型（情景 7 / 计划 2 / 事实 180 / 关系 90 / 偏好 60 / 未知 30） */
 const BASE_TTL_DAYS = Object.freeze({
     episodic: 7,
     planned: 2,
@@ -1952,13 +1948,13 @@ const REINFORCE_TTL_STEP = 0.1;
 const REINFORCE_TTL_CAP = 0.5;
 /** 反思触发轮数（§20.5：每 N 轮在变量请求 jsonSchema 追加 memory_candidates） */
 const REFLECTION_EVERY_N_TURNS = 10;
-/** 远记忆归档：未归档 changelog 达阈值才批量归档（shujuku 归档语义） */
+/** 远记忆归档：未归档 changelog 达阈值才批量归档（§20.5 归档语义） */
 const ARCHIVE_THRESHOLD = 50;
 /** 归档批大小：每批选最早 3 条压缩（整批成功才删原日志，失败保留、下轮重试） */
 const ARCHIVE_BATCH_SIZE = 3;
-/** RRF 融合常数（livingmemory reciprocal rank fusion 思路） */
+/** RRF 融合常数（多路召回融合） */
 const RRF_K = 60;
-/** BM25 参数（shujuku summary-vector-hybrid-retrieval.ts：bigram + k1=1.5/b=0.75） */
+/** BM25 参数（bigram 分词 + k1=1.5/b=0.75） */
 const BM25_K1 = 1.5;
 const BM25_B = 0.75;
 /** 检索命中 → 衰减乘子过滤下限（importance × decay 过低不注入） */
@@ -2036,7 +2032,7 @@ function maintainMemory(store, now) {
     return { expired, forgotten, purged: before - store.atoms.length };
 }
 // ============================================================
-// §20.4 分词与 BM25（纯 JS；shujuku bigram 思路）
+// §20.4 分词与 BM25（纯 JS：CJK bigram + 拉丁整词）
 // ============================================================
 /**
  * 分词：CJK 连续段 → bigram（单字段保留 unigram，短查询可命中）；
@@ -2272,7 +2268,7 @@ function searchMemory(store, query, options = {}) {
     return ranked.map(({ atom }) => atom);
 }
 /**
- * L3「记忆段」注入文本（shujuku `<记忆回溯>` 模板；只进 L3 尾部，绝不碰 L0-L2 前缀）。
+ * L3「记忆段」注入文本（`<记忆回溯>` 包裹；只进 L3 尾部，绝不碰 L0-L2 前缀）。
  * 预算内按（importance × decay）排序截断；产出 null 表示无可用记忆。
  */
 function renderMemorySegment(store, query, options) {
@@ -2410,7 +2406,7 @@ function selectArchiveBatch(entries, threshold = ARCHIVE_THRESHOLD, batchSize = 
 }
 /**
  * 归档提交：总结成功（summaryText 非空）→ 删除整批原条目 + 产出一条归档总结（进长期记忆）；
- * 失败（summaryText 空）→ 原批保留、下轮重试（shujuku 归档语义）。
+ * 失败（summaryText 空）→ 原批保留、下轮重试（§20.5 整批成功才删语义）。
  */
 function commitArchive(entries, batch, summaryText) {
     if (!summaryText)
@@ -2419,7 +2415,7 @@ function commitArchive(entries, batch, summaryText) {
     const kept = entries.filter((entry) => !batchIds.has(entry.id ?? `${entry.turnId}:${entry.path}:${String(entry.source ?? '')}`));
     return { entries: kept, summary: summaryText };
 }
-/** 按楼层快照（shujuku ChatVectorRemoteMemoryBatch：楼层回退不被未来污染；§20.5） */
+/** 按楼层快照（楼层回退不被未来污染；§20.5） */
 function snapshotByFloor(atoms) {
     const map = new Map();
     for (const atom of atoms) {
@@ -2431,10 +2427,10 @@ function snapshotByFloor(atoms) {
     return map;
 }
 // ============================================================
-// §20.7 结构化记忆表（yuzuki：列定义 + 行记录；档案/物品/世界设定）
+// §20.7 结构化记忆表（列定义 + 行记录；档案/物品/世界设定）
 // ============================================================
 /**
- * 列前缀语义（yuzuki memory-io.js）：
+ * 列前缀语义：
  * - `#` 追加列：upsert 时新值追加到旧值之后（分隔符「；」）；
  * - `*` 只填一次列：已有非空值则忽略新值；
  * - 首列为主键列。
@@ -2641,7 +2637,7 @@ var memory = /*#__PURE__*/Object.freeze({
  *
  * 纯编排：所有 IO（发请求 / 读工具结果）经注入的 transport，可单测。
  */
-/** 失败反馈截断上限（shujuku 审计 SQL_ERROR_MARKER：截断-替换注入，防撑爆重试上下文） */
+/** 失败反馈截断上限（截断-替换注入，防撑爆重试上下文） */
 const FEEDBACK_MAX_CHARS = 2000;
 /**
  * 单次模式：一步 agent 回合（§0.1-A 默认形态）。
@@ -2673,7 +2669,7 @@ async function runSingleShotAgent(transport, opts) {
         // §22.7：世界推演状态作为 CES 文本谓词数据源（{source:'plot_states', contains:'已爆发'}）
         plot_states: opts.plotStates ?? '',
     });
-    // 4. 前缀 + 尾部（§5.1 L0-L3；Full Refresh 全量快照校准，CFS 审计项 8）
+    // 4. 前缀 + 尾部（§5.1 L0-L3；Full Refresh 全量快照校准，§5.4 审计项 8）
     const fullRefreshEveryN = opts.fullRefreshEveryN ?? 0;
     const { segments } = buildPrefixSegments(contract, state, due, { l0: opts.l0 });
     // 4a. L3「记忆段」（§20.6：检索 top-K 注入；预算与观察层共用 maxStatusTokens，前缀不受影响）
@@ -2699,7 +2695,7 @@ async function runSingleShotAgent(transport, opts) {
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
         result.requested = true;
         result.retries = attempt;
-        // 失败原因喂回（§3.4-D：自纠重试）；截断防撑爆上下文（shujuku 审计 SQL_ERROR_MARKER）
+        // 失败原因喂回（§3.4-D：自纠重试）；截断防撑爆上下文
         const feedbackText = feedback.join('\n');
         const requestMessages = feedbackText
             ? [...messages, { role: 'system', content: `上一轮更新失败，请修正后重试：\n${feedbackText.slice(0, FEEDBACK_MAX_CHARS)}` }]
@@ -2721,17 +2717,17 @@ async function runSingleShotAgent(transport, opts) {
         // 7. 应用 + changelog
         applyOps(state, gated, turnId, { source: 'agent' });
         result.applied.push(...gated);
-        // 8. 稳定性演化（CFS Fast Demote）+ frozen drift 上报
+        // 8. 稳定性演化（Fast Demote）+ frozen drift 上报
         const changedPaths = new Set(gated.map((op) => op.path));
         for (const path of changedPaths) {
             const field = contract.updateRules[path];
             if (field?.stability === 'frozen')
-                result.frozenDrift.push(path); // frozen 变化 → drift（injection_strategy.js:619-627）
+                result.frozenDrift.push(path); // frozen 变化 → drift（§17.13-C6）
         }
         const demotion = stabilityDemotion(contract, changedPaths, state.meta.stabilityDemotions ?? (state.meta.stabilityDemotions = {}));
         result.demoted.push(...demotion.demoted);
         result.thrashLocked.push(...demotion.locked);
-        // 9. changelog 两段式维护（shujuku 审计：生产路径接线；checkpoint 三触发条件）
+        // 9. changelog 两段式维护（§17.14-S3：生产路径接线；checkpoint 三触发条件）
         if (shouldCheckpoint(state, Date.now()))
             makeCheckpoint(state, 'periodic');
         trimChangelog(state);
@@ -3270,23 +3266,23 @@ function takeSnapshot(config, reason, now = Date.now()) {
 /**
  * M15 剧情编排引擎核心（§22，作者可选、默认关闭；纯 JS 零依赖）。
  *
- * 蒸馏自 World-master（F:\科研\打包\World-master，world-engine-evolution.js 逐行核对）：
+ * 能力面（详见交接稿 §22.1-§22.6）：
  * - 事件链状态机：双类型（conflict/progress）+ 四阶段 + 每阶段 9 格 + Lv 分级 + 终局语义；
  * - 本地骰子/API 双驱：骰子先掷基线（成功/受挫/保持 + 保底强制成功），API 改写以 API 为准；
  * - 风声/舆论：四类（announcement/report/rumor/sentiment）+ 衰减参数（base/grace/linear/quadratic）；
- * - 区域突发事件骰子：加权随机 + 持续轮 + 冷却轮（REGIONAL_INCIDENT_CONFIG）；
+ * - 区域突发事件骰子：加权随机 + 持续轮 + 冷却轮；
  * - 感知边界：玩家全知 ≠ 主角全知（约束模板进 L0-L2 稳定段，只影响注入不破坏前缀）。
  *
- * 关键语义（source 行号见各函数注释）：
- * - 正面终局（已爆发/已完成）骰子可自动给出；负面终局（已消散/已失败）只能 API 判定（world-engine-evolution.js:580-581）；
- * - 每阶段 9 格，满 9 晋级下一阶段（:579）；终局阶段锁定 9/9（:741）；
- * - threshold = round(stageBase − 200·r·(1−r) + levelAdjust − modifier)（:618）；
- *   levelAdjust：progress +(level−1)·10（越大越难），conflict −(level−1)·10（越大越易，:617）；
- * - 受挫判定 dice < threshold × setbackRatio%（默认 40，:628）；
- * - 保底：连续非成功达 maxFails 强制成功（conflict 6−Lv（≥1）/ progress 2+Lv，:643-648）。
+ * 关键语义：
+ * - 正面终局（已爆发/已完成）骰子可自动给出；负面终局（已消散/已失败）只能 API 判定；
+ * - 每阶段 9 格，满 9 晋级下一阶段；终局阶段锁定 9/9；
+ * - threshold = round(stageBase − 200·r·(1−r) + levelAdjust − modifier)；
+ *   levelAdjust：progress +(level−1)·10（越大越难），conflict −(level−1)·10（越大越易）；
+ * - 受挫判定 dice < threshold × setbackRatio%（默认 40）；
+ * - 保底：连续非成功达 maxFails 强制成功（conflict 6−Lv（≥1）/ progress 2+Lv）。
  */
 // ============================================================
-// §22.2 事件链状态机常量（world-engine-evolution.js:7-22）
+// §22.2 事件链状态机常量
 // ============================================================
 const EVENT_TYPES = ['conflict', 'progress'];
 const PLOT_STAGE_ORDER = Object.freeze({
@@ -3302,34 +3298,34 @@ const PLOT_TERMINAL_STAGES = Object.freeze({
     conflict: ['已爆发', '已消散'],
     progress: ['已完成', '已失败'],
 });
-/** 各阶段基准阈值（world-engine-evolution.js:19-22） */
+/** 各阶段基准阈值 */
 const PLOT_STAGE_BASE = Object.freeze({
     conflict: { '萌芽': 95, '发酵': 85, '逼近': 75 },
     progress: { '筹备': 75, '执行': 85, '关键': 95 },
 });
-/** 受挫判定比例（默认 40%，:628 localEventSetbackRatioPercent） */
+/** 受挫判定比例（默认 40%） */
 const PLOT_SETBACK_RATIO = 0.4;
-/** 骰子修正（默认 0，:618 localEventDiceModifier） */
+/** 骰子修正（默认 0） */
 const PLOT_DICE_MODIFIER_DEFAULT = 0;
-/** 保底参数（:643-648）：conflict 6−Lv（≥1）；progress 2+Lv */
+/** 保底参数：conflict 6−Lv（≥1）；progress 2+Lv */
 const PLOT_FAIL_BASE = Object.freeze({ conflict: 6, progress: 2 });
-/** 正面终局保留轮数：base 2 + level×2（:66-70） */
+/** 正面终局保留轮数：base 2 + level×2 */
 const PLOT_TERMINAL_KEEP_BASE = 2;
 const PLOT_TERMINAL_KEEP_PER_LEVEL = 2;
-/** 事件链上限（localCapEvents，api.js 默认 16） */
+/** 事件链上限（默认 16） */
 const MAX_PLOT_EVENTS = 16;
 const PLOT_INFLUENCE_KEEP_ROUNDS = 8;
 function rollDice(randomFn) {
     return Math.floor(randomFn() * 100) + 1;
 }
-/** 保底阈值：连续非成功达此值 → 强制成功（:643-648） */
+/** 保底阈值：连续非成功达此值 → 强制成功 */
 function maxFailsFor(event) {
     const level = event.level || 1;
     return event.type === 'progress'
         ? PLOT_FAIL_BASE.progress + level
         : Math.max(1, PLOT_FAIL_BASE.conflict - level);
 }
-/** 推进阈值（:614-618）：stageBase − 200·r·(1−r) + levelAdjust − modifier，r = min(1, stageRound/9) */
+/** 推进阈值：stageBase − 200·r·(1−r) + levelAdjust − modifier，r = min(1, stageRound/9) */
 function eventThreshold(event, modifier = PLOT_DICE_MODIFIER_DEFAULT) {
     const r = Math.min(1, (event.stageRound || 1) / 9);
     const stageBase = (PLOT_STAGE_BASE[event.type] ?? PLOT_STAGE_BASE.conflict)[event.stage] ?? 85;
@@ -3337,7 +3333,7 @@ function eventThreshold(event, modifier = PLOT_DICE_MODIFIER_DEFAULT) {
     const levelAdjust = event.type === 'progress' ? (level - 1) * 10 : -((level - 1) * 10);
     return Math.round(stageBase - 200 * r * (1 - r) + levelAdjust - modifier);
 }
-/** 阶段推进：stageRound+1；满 9 → 晋级下一阶段（重置 1）或进入正面终局（锁定 9）（:650-665） */
+/** 阶段推进：stageRound+1；满 9 → 晋级下一阶段（重置 1）或进入正面终局（锁定 9） */
 function advanceStageRound(event) {
     const stageOrder = PLOT_STAGE_ORDER[event.type] ?? PLOT_STAGE_ORDER.conflict;
     const finalStage = PLOT_FINAL_STAGE[event.type] ?? PLOT_FINAL_STAGE.conflict;
@@ -3356,7 +3352,7 @@ function advanceStageRound(event) {
     return { promoted: false, terminalReached: false };
 }
 /**
- * 本地骰子推进一轮（双驱之一，:583-641）：
+ * 本地骰子推进一轮（双驱之一）：
  * - 终局阶段跳过（负面终局骰子永不自动给，正面终局锁定）；
  * - 连续非成功 ≥ maxFails → 保底强制成功（防事件停滞）；
  * - dice > threshold → 成功推进；dice < threshold×setbackRatio → 受挫倒退；否则保持。
@@ -3380,7 +3376,7 @@ function rollEventDice(input, options = {}) {
     if (!event.stage || !stageOrder.includes(event.stage))
         event.stage = stageOrder[0];
     const threshold = eventThreshold(event, options.modifier ?? PLOT_DICE_MODIFIER_DEFAULT);
-    // 保底：连续非成功达上限 → 强制成功（:602-611）
+    // 保底：连续非成功达上限 → 强制成功
     if (event.consecutiveFails >= maxFailsFor(event)) {
         const { promoted, terminalReached } = advanceStageRound(event);
         event.consecutiveFails = 0;
@@ -3408,12 +3404,12 @@ function rollEventDice(input, options = {}) {
     event.evolveResult = '保持';
     return { event, result: '保持', threshold, dice, promoted: false, terminalReached: false };
 }
-/** 正面终局保留轮数：2 + Lv×2（:66-70）；负面终局下轮即删（:1274-1295） */
+/** 正面终局保留轮数：2 + Lv×2；负面终局下轮即删 */
 function terminalKeepRounds(event) {
     return PLOT_TERMINAL_KEEP_BASE + (event.level || 1) * PLOT_TERMINAL_KEEP_PER_LEVEL;
 }
 /**
- * 终局保留期维护（:1274-1295）：已消散/已失败 → 下一轮删除；
+ * 终局保留期维护：已消散/已失败 → 下一轮删除；
  * 已爆发/已完成 → 保留 2+Lv×2 轮（余波铺陈）后删除；删除前进 terminalSnapshot 供账本记录。
  */
 function maintainPlotEvents(events, round) {
@@ -3474,7 +3470,7 @@ function maintainPlotInfluences(events, round) {
     }
 }
 /**
- * 账本行生成（ledger.js:19-99 语义）：事件链普通变化只记 Lv≥3；任何等级终局都记；
+ * 账本行生成：事件链普通变化只记 Lv≥3；任何等级终局都记；
  * 风声仅「新增」Lv≥3 记 wind_new。返回人类可读行（写已有 changelog，source:'plot'）。
  */
 function plotLedgerLines(before, after, windsBefore, windsAfter) {
@@ -3526,7 +3522,7 @@ function applyApiEventUpdates(events, updates, now = Date.now(), round) {
             continue;
         const existing = update.id ? result.find((e) => e.id === update.id) : undefined;
         if (existing) {
-            // 终局事件保护（evolution.js:1153-1158）：终局只允许改 desc，其余字段一律忽略
+            // 终局事件保护：终局只允许改 desc，其余字段一律忽略
             const existingTerminal = PLOT_TERMINAL_STAGES[existing.type]?.includes(existing.stage);
             if (existingTerminal) {
                 if (update.desc !== undefined)
@@ -3548,7 +3544,7 @@ function applyApiEventUpdates(events, updates, now = Date.now(), round) {
             }
             if (update.stage !== undefined && update.stage !== existing.stage) {
                 existing.stage = update.stage;
-                // 终局锁定 9/9（:741）；负面终局同样锁定
+                // 终局锁定 9/9；负面终局同样锁定
                 if (PLOT_TERMINAL_STAGES[existing.type]?.includes(existing.stage)) {
                     existing.stageRound = 9;
                     existing.terminalRound = round;
@@ -3598,17 +3594,17 @@ function applyApiEventUpdates(events, updates, now = Date.now(), round) {
             created.push(event);
         }
     }
-    // 上限保护（localCapEvents 默认 16：保留最新 16 条，evolution.js:1140-1188 unshift 语义）
+    // 上限保护（默认 16：保留最新 16 条）
     if (result.length > MAX_PLOT_EVENTS) {
         result.splice(0, result.length - MAX_PLOT_EVENTS);
     }
     return { events: result, created, terminated };
 }
 // ============================================================
-// §22.5 风声 / 舆论系统（world-engine-evolution.js:23-28, 671-703）
+// §22.5 风声 / 舆论系统
 // ============================================================
 const WIND_TYPES = ['announcement', 'report', 'rumor', 'sentiment'];
-/** 四类风声衰减参数（:23-28）：base/grace/linear/quadratic */
+/** 四类风声衰减参数：base/grace/linear/quadratic */
 const WIND_DECAY = Object.freeze({
     announcement: { base: 10, grace: 4, linear: 3, quadratic: 1 },
     report: { base: 20, grace: 2, linear: 4, quadratic: 2 },
@@ -3616,7 +3612,7 @@ const WIND_DECAY = Object.freeze({
     sentiment: { base: 8, grace: 5, linear: 2, quadratic: 1 },
 });
 /**
- * 风声消散轮（:674-703）：quietRounds+1；grace 内必存活；
+ * 风声消散轮：quietRounds+1；grace 内必存活；
  * 之后 chance = clamp(5, 95, base + linear·n + quadratic·n² − (level−1)·10)；dice ≤ chance → 消散。
  * API 同轮更新同 id 风声会把 quietRounds 归零（由 applyApiWindUpdates 处理）。
  */
@@ -3652,7 +3648,7 @@ function applyApiWindUpdates(winds, updates, now = Date.now()) {
             continue;
         const existing = update.id ? result.find((w) => w.id === update.id) : undefined;
         if (existing) {
-            existing.quietRounds = 0; // API 本轮提及 → 传播延续（:672-673）
+            existing.quietRounds = 0; // API 本轮提及 → 传播延续
             if (update.topic !== undefined)
                 existing.topic = update.topic;
             if (update.content !== undefined)
@@ -3678,7 +3674,7 @@ function applyApiWindUpdates(winds, updates, now = Date.now()) {
     return { winds: result, created };
 }
 // ============================================================
-// §22.3/§22.2 区域突发事件骰子（world-engine-evolution.js:84-102）
+// §22.3/§22.2 区域突发事件骰子
 // ============================================================
 const REGIONAL_INCIDENT_CONFIG = Object.freeze({
     chance: 0.03,
@@ -3700,7 +3696,7 @@ const REGIONAL_INCIDENT_CONFIG = Object.freeze({
     ],
 });
 /**
- * 区域突发事件轮（:82-102 语义）：进行中 → roundsLeft−1，归零进冷却；
+ * 区域突发事件轮：进行中 → roundsLeft−1，归零进冷却；
  * 冷却中 → cooldown−1；空闲 → 按 chance 加权随机触发。
  */
 function rollRegionalIncident(state, options = {}) {
@@ -3770,7 +3766,7 @@ function renderPlotSegment(events, winds) {
 // ============================================================
 // 世界推演请求 jsonSchema（§22.3 复用变量通道）
 // ============================================================
-/** 世界推演请求 schema：{events, winds, regionalIncident}（对齐 source OUTPUT_INSTRUCTIONS :705-733） */
+/** 世界推演请求 schema：{events, winds}（含字数限制与影响链字段） */
 function buildWorldEvolutionSchema() {
     return {
         name: 'nlkaleido_world_evolution',
@@ -4647,7 +4643,7 @@ const STORE_KEY_CONFIG = 'nlkaleido:config';
 /** @since M14 配置快照键（防奶人：破坏性操作前自动备份） */
 const STORE_KEY_CONFIG_BACKUP = 'nlkaleido:config.backup';
 /**
- * commit 串行器（§17.14-S1：mutation 可并行 / commit 串行；shujuku 审计落地）。
+ * commit 串行器（§17.14-S1：mutation 可并行 / commit 串行）。
  * 面板编辑 / AI 更新 / 导入统一经此单一写入口排队；单条失败不阻塞队列，错误上浮供面板展示。
  */
 class CommitQueue {
@@ -4762,7 +4758,7 @@ class KaleidoStAdapter {
         const plotEnabled = contract.plot?.enabled === true;
         const plotStates = plotEnabled ? renderPlotSegment(this.adapter.plotEvents, this.adapter.plotWinds) : undefined;
         // §22.4 感知边界：只注入角色可合法感知的世界状态
-        // （world-engine-inject.js:97-136：事件 Lv≥3 全注入 / Lv1-2 仅终局注入；风声 Lv≥3 才注入）
+        // （§22.4 感知边界：事件 Lv≥3 全注入 / Lv1-2 仅终局注入；风声 Lv≥3 才注入）
         const plotSegment = plotEnabled
             ? renderPlotSegment(this.adapter.plotEvents.filter((e) => (PLOT_TERMINAL_STAGES[e.type] ?? []).includes(e.stage) || (e.level ?? 1) >= 3), this.adapter.plotWinds.filter((w) => (w.level ?? 1) >= 3)) || null
             : null;
@@ -4859,7 +4855,7 @@ class KaleidoStAdapter {
             const outcome = rollEventDice(events[i], { modifier, setbackRatio, round });
             events[i] = outcome.event;
         }
-        // 终局保留期维护（evolution.js:1274-1295：负面终局下轮即删；正面终局保留 2+Lv×2 轮）
+        // 终局保留期维护（负面终局下轮即删；正面终局保留 2+Lv×2 轮）
         const maintained = maintainPlotEvents(events, round);
         this.adapter.plotEvents = maintained.events;
         // 影响链过期清理（:1233-1247 保留 8 轮不续期）
@@ -4879,7 +4875,7 @@ class KaleidoStAdapter {
             if (started || ended)
                 this.onPlotChanged?.();
         }
-        // 账本（ledger.js:19-99：Lv≥3 变化 / 任何终局 / 新增 Lv≥3 风声 → 写已有 changelog，source:'plot'）
+        // 账本（§22.5：Lv≥3 变化 / 任何终局 / 新增 Lv≥3 风声 → 写已有 changelog，source:'plot'）
         const terminalLines = maintained.terminalSnapshot.map((e) => `event_terminal_cleanup: ${e.name} → ${e.stage}`);
         const ledgerLines = [
             ...plotLedgerLines(eventsBefore, this.adapter.plotEvents, windsBefore, this.adapter.plotWinds),
@@ -5243,7 +5239,7 @@ class KaleidoStAdapter {
     // ============================================================
     // M13 记忆接线（§20.3/§20.5/§20.6；全部默认关闭路径，未启用不执行）
     // ============================================================
-    /** 当前楼层锚点（yuzuki floor scope；MVP 无世界书楼层 → undefined 不隔离） */
+    /** 当前楼层锚点（MVP 无世界书楼层 → undefined 不隔离） */
     currentFloorId() {
         return undefined;
     }
@@ -5267,7 +5263,7 @@ class KaleidoStAdapter {
         this.onMemoryChanged?.();
     }
     /**
-     * 远记忆归档（§20.5/M13g，shujuku 归档语义）：未归档 changelog 达阈值 → 最早一批
+     * 远记忆归档（§20.5/M13g）：未归档 changelog 达阈值 → 最早一批
      * → 独立总结请求 → 成功才删除原批 + 写长期摘要原子；失败整批保留、下轮重试。
      * 异步 fire-and-forget：绝不拉长变量链路。
      */
@@ -5426,11 +5422,11 @@ class KaleidoStAdapter {
     // usage 埋点（§10.2 readUsage，U5 字段口径）
     // ============================================================
     /**
-     * 解析 usage → Metrics（U5 + worldbook-manager 审计字段链）：
+     * 解析 usage → Metrics（U5）：
      * hit 源优先级 prompt_cache_hit_tokens → cached_tokens → cachedContentTokenCount →
-     * cached_content_token_count → cache_read_input_tokens（monitor.ts:2130-2136）；
+     * cached_content_token_count → cache_read_input_tokens；
      * miss 源 prompt_cache_miss_tokens → uncached_tokens → cache_creation_input_tokens，
-     * 缺失时 miss = max(0, promptTokens − hitTokens)（monitor.ts:2137-2149）。
+     * 缺失时 miss = max(0, promptTokens − hitTokens)。
      */
     readUsage(data) {
         const usage = data?.usage;
@@ -5469,7 +5465,7 @@ class KaleidoStAdapter {
         return { hitTokens: hit, missTokens: miss };
     }
     // ============================================================
-    // G3 提示词查看器式提取（格式补全 §3.4：generate → SETTINGS_READY 截停拿真实 messages）
+    // G3 提示词查看器式提取（§10.2：generate → SETTINGS_READY 截停拿真实 messages）
     // ============================================================
     /**
      * 提取当前正文请求的最终 messages（G3，§10.2 extractCurrentPrompt）：
@@ -5524,7 +5520,7 @@ class KaleidoStAdapter {
         });
     }
     // ============================================================
-    // G4 intercept_anchor 注入（格式补全 §3.2：不新增消息条数，前缀更稳）
+    // G4 intercept_anchor 注入（§10.2：不新增消息条数，前缀更稳）
     // ============================================================
     /**
      * 锚点后拦截注入（G4，§10.2 intercept_anchor）：变量任务提示词插入末尾 user 消息锚点之后，
@@ -5551,7 +5547,7 @@ class KaleidoStAdapter {
         if (!this.adapter.toolsRegistered && typeof context.registerFunctionTool === 'function') {
             context.registerFunctionTool('get_state', (async () => this.toolGetState()));
             context.registerFunctionTool('apply_patch', (async (args) => this.toolApplyPatch(args?.ops ?? [])));
-            // §20.9 记忆工具（livingmemory recall_long_term_memory / memorize_long_term_memory；仅记忆开启时注册）
+            // §20.9 记忆工具（recall / memorize 语义；仅记忆开启时注册）
             if (this.adapter.contract?.memory?.enabled) {
                 context.registerFunctionTool('memory_search', (async (args) => this.toolMemorySearch(String(args?.query ?? ''))));
                 context.registerFunctionTool('memory_memorize', (async (args) => this.toolMemoryMemorize(args ?? {})));
@@ -5779,7 +5775,7 @@ class KaleidoStAdapter {
         return hash64(chat.slice(-12).map((m) => m.mes ?? '').join('\n'));
     }
 }
-/** 最后一个匹配（格式补全 §3.6 P：g flag + 空匹配保护） */
+/** 最后一个匹配（g flag + 空匹配保护） */
 function findLastMatch(text, regex) {
     const flags = regex.flags.includes('g') ? regex.flags : `${regex.flags}g`;
     const global = new RegExp(regex.source, flags);
@@ -9997,7 +9993,7 @@ class KaleidoStateBridge {
             pending: state.meta.pending,
             revision: state.revision,
             lastTurnId: state.meta.lastTurnId,
-            persistError: this.adapter.commit.lastError, // §17.14-S1 落盘失败上浮（shujuku 审计）
+            persistError: this.adapter.commit.lastError, // §17.14-S1 落盘失败上浮
         });
     }
     notifyPendingUpdated(state) {
@@ -23148,7 +23144,7 @@ const MigrationView = defineComponent({
             busy.value = true;
             try {
                 // 动态 import：迁移代码独立 chunk，默认关闭主 bundle 不含（§24.1 代码分包）
-                const migration = await import('./migration-DNk4Lemz.js');
+                const migration = await import('./migration-B8WcJhrZ.js');
                 let worldbookEntries = [];
                 let scripts = [];
                 try {
@@ -23441,7 +23437,7 @@ function createStGlobals() {
         saveChat: () => {
             const context = fresh();
             if (typeof context.saveChat === 'function') {
-                void context.saveChat(); // getContext().saveChat = saveChatConditional（st-context.js:151）
+                void context.saveChat(); // 立即落盘聊天文件
             }
         },
         getExtensionSettings: () => (fresh().extensionSettings ?? {}),

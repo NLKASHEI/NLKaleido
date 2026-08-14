@@ -1,22 +1,21 @@
-import { h as hash64 } from './entry-BSIO7ML2.js';
+import { h as hash64 } from './entry-DGyCnQOR.js';
 
 /**
  * M9 MVU 存量卡迁移脚手架（§24，作者可选、默认关闭；纯字符串扫描，禁 eval/new Function）。
  *
  * 硬性约束（§24.1）：
  * - 只存在导入流程，绝不参与运行时链路（onMessageReceived/dueFields/buildTail/requestVariableUpdate）；
- * - 零 tavern-helper 依赖；`_.xxx()` / `[mvu_update]` / `[initvar]` 只出现在导入器输出文本中；
+ * - 零第三方脚本框架依赖；`_.xxx()` / `[mvu_update]` / `[initvar]` 只出现在导入器输出文本中；
  * - 定位「辅助脚手架」：自动翻译 + 显式标注「需人工确认」，不做静默丢弃、不做无损承诺；
  * - 生成物全部人类可读文本；本模块经动态 import 分包（默认关闭不加载，§24.1 代码分包）。
  *
- * 参考（MVU-Innovation / MagVarUpdate-beta，逐行核对）：
- * - [initvar] 检测：variable_init.ts:263 comment?.toLowerCase().includes('[initvar]')；
- * - ZOD 检测：agent_zod.ts:17-20 /registerMvuSchema/|/mvu_zod(?:\.js)?/、:117 /Schema\s*=\s*z\.object\(/；
- * - [mvu_update] 检测：variable_def.ts:316 /\[mvu_update\]/i（名字+内容联合匹配，agent_worldbook.ts:51-53）；
- * - 命令检测：update_variables.ts:317 /_\.(set|insert|assign|remove|unset|delete|add)\(/；
- * - JSON Patch 块：update_variables.ts:286 /<(json_?patch)>…<\/\1>/；
- * - ZOD 解析骨架（agent_zod.ts:23-103）：findMatchingClose（引号/括号感知）+ splitTopLevelItems + findTopLevelColon + kindOfValue；
- * - 关键对照：parseCommandValue（update_variables.ts:86-173）的 new Function/mathjs 是反面教材——本模块绝不引入。
+ * 解析要点（全部纯文本扫描，绝无求值）：
+ * - [initvar] 检测：条目注释/内容含 [initvar]（大小写不敏感）；
+ * - ZOD 检测：脚本含 registerMvuSchema/mvu_zod 且含 `Schema = z.object(`；
+ * - [mvu_update] 检测：条目名+内容含 [mvu_update]；
+ * - 命令检测：`_.set/insert/assign/remove/unset/delete/add(` 调用或 JSON Patch 块；
+ * - ZOD 解析骨架：findMatchingClose（引号/括号感知）+ splitTopLevelItems + findTopLevelColon + kindOfValue；
+ * - 硬约束：原卡表达式的 new Function/mathjs 求值语义绝不带入（本模块零求值）。
  */
 const MVU_INITVAR_RE = /\[initvar\]/i;
 const MVU_ZOD_SCRIPT_RE = /registerMvuSchema|mvu_zod(?:\.js)?/;
@@ -24,7 +23,7 @@ const MVU_ZOD_SCHEMA_RE = /Schema\s*=\s*z\.object\(/;
 const MVU_UPDATE_RE = /\[mvu_update\]/i;
 const MVU_COMMAND_RE = /_\.(set|insert|assign|remove|unset|delete|add)\(/g;
 const MVU_JSON_PATCH_RE = /<(json_?patch)>(?:(?!<json_?patch>)[\s\S])*?<\/\1>/gim;
-/** 风险特征（§24.2/蒸馏 §E 表：难翻译构造 → 需人工确认） */
+/** 风险特征（§24.2：难翻译构造 → 需人工确认） */
 const RISK_PATTERNS = [
     { name: 'UI 渲染占位符 <StatusPlaceHolderImpl/>（丢弃）', re: /<StatusPlaceHolderImpl\/>/ },
     { name: 'VWD 二元组 [值, 描述]（描述即触发规则）', re: /\[\s*[^\]]+,\s*[^\]]+\s*\]/ },
@@ -62,7 +61,7 @@ function detectMvuCard(source) {
     const summary = `MVU 特征命中 ${hits}/4（${names.join('、') || '无'}）→ 置信度「${confidence}」${confidence === '低' ? '：可能不是 MVU 卡，建议确认后继续' : ''}`;
     return { isMvu: hits > 0, confidence, features, hits, risks, summary };
 }
-/** 找配对闭括号（引号/括号感知；agent_zod.ts:23-46 findMatchingClose 同构） */
+/** 找配对闭括号（引号/括号感知） */
 function findMatchingClose(text, openIndex) {
     const open = text[openIndex];
     const close = open === '{' ? '}' : open === '[' ? ']' : open === '(' ? ')' : '';
@@ -97,7 +96,7 @@ function findMatchingClose(text, openIndex) {
     }
     return -1;
 }
-/** 顶层逗号切分（深度 + 引号感知；agent_zod.ts:49-79 splitTopLevelItems 同构） */
+/** 顶层逗号切分（深度 + 引号感知） */
 function splitTopLevelItems(text) {
     const items = [];
     let depth = 0;
@@ -134,7 +133,7 @@ function splitTopLevelItems(text) {
         items.push(tail);
     return items.map((item) => item.trim()).filter(Boolean);
 }
-/** 顶层冒号（键值分界；agent_zod.ts:192-212 findTopLevelColon 同构） */
+/** 顶层冒号（键值分界） */
 function findTopLevelColon(text) {
     let depth = 0;
     let inString = false;
@@ -171,7 +170,7 @@ function stripQuotes(value) {
     }
     return trimmed;
 }
-/** kindOfValue（agent_zod.ts:87-103）：z.object → 递归；z.record → kv；z.array → list；其余 leaf */
+/** kindOfValue：z.object → 递归；z.record → kv；z.array → list；其余 leaf */
 function kindOfZodValue(valueExpr) {
     if (/z\.object\s*\(/.test(valueExpr))
         return 'object';
@@ -224,7 +223,7 @@ function parseZodObjectBody(body, prefix, startLine, out) {
         // record 必须先于 object 判定：z.record(键, z.object({...})) 内部含 z.object(；
         // startsWith 保证只认顶层（嵌套 record/object 不误判）
         if (valueExpr.startsWith('z.record')) {
-            // record(键 schema, 值 schema)：值 schema 为 object → 子字段路径.<键> 模板（agent_zod.ts:161-179）
+            // record(键 schema, 值 schema)：值 schema 为 object → 子字段路径.<键> 模板
             const open = valueExpr.indexOf('(');
             const close = findMatchingClose(valueExpr, open);
             const args = close > open ? splitTopLevelItems(valueExpr.slice(open + 1, close)) : [];
@@ -282,7 +281,7 @@ const INTENT_PATTERNS = [
     { intent: '跨变量引用', re: /getvar\(|\{\{get_message_variable::|_\.set\s*\(\s*['"]<user>/ },
     { intent: '值覆盖', re: /_\.set\(/ },
 ];
-/** 提取命令（update_variables.ts:281-400 语义：括号配对状态机 + `//reason`；绝无求值） */
+/** 提取命令（括号配对状态机 + `//reason`；绝无求值） */
 function extractMvuCommands(content) {
     const commands = [];
     const re = /_\.(set|insert|assign|remove|unset|delete|add)\(/g;
@@ -305,7 +304,7 @@ function extractMvuCommands(content) {
             continue; // 格式模板行（${path}/${old}/${new}）非真实更新命令
         commands.push({
             command,
-            path: path.replace(/\[0\]$/, ''), // VWD [0] 归一（蒸馏 §F4）
+            path: path.replace(/\[0\]$/, ''), // VWD [0] 归一
             oldValue: args[1] !== undefined ? stripQuotes(args[1]) : undefined,
             newValue: args.length >= 3 ? stripQuotes(args[2]) : (args.length === 2 && command !== 'remove' && command !== 'unset' && command !== 'delete' ? stripQuotes(args[1]) : undefined),
             reason,
