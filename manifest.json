@@ -1,0 +1,12 @@
+{
+    "display_name": "NLKaleido 万花筒",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "js": "dist/index.js",
+    "css": "",
+    "author": "NLKaleido",
+    "version": "0.1.0",
+    "homePage": "",
+    "auto_update": false
+}
