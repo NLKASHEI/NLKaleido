@@ -1,49 +1,27 @@
 /**
- * hash64 —— 64 位双通道混合哈希（§7 G2，借鉴「压缩相邻消息」）。
- * 0x9E3779B1 / 0x5F356495 乘法 + Murmur 雪崩；快于 sha256，适合消息/内容高频指纹。
+ * hash64 —— 64 位双通道混合哈希（§7 G2，按《压缩相邻消息_绿灯缓存算法还原.md》§3.2 原文还原）。
+ * 0x9E3779B1 / 0x5F356495 乘法通道 + 0x85ebca6b / 0xc2b2ae35 交叉雪崩（Murmur 风格）；
+ * 输出 `${h2}${h1}` 各 8 位十六进制共 16 位。快于 sha256，适合消息/内容高频指纹。
  * 纯 TS、同步、无 crypto 依赖（浏览器端可用）。
  *
- * 【实现决策】KaleidoState.revision.hash（§7 声明 sha256）在浏览器同步路径下改走 hash64
- * （FNV-1a 风格双通道 + Murmur 终混）。需要密码学强度时（P2 checkpoint 校验）由存储层
- * 用 Web Crypto `crypto.subtle.digest('SHA-256')`（异步）另行计算。
+ * 【实现决策】KaleidoState.revision.hash（§7 声明 sha256）在浏览器同步路径下改走 hash64；
+ * 需要密码学强度时（P2 checkpoint 校验）由存储层用 Web Crypto `crypto.subtle.digest('SHA-256')`
+ * （异步）另行计算。
  */
-/** FNV-1a 64 位（双通道异或混合） */
-function fnv1a64(text) {
-    let hash = 0xcbf29ce484222325n;
-    for (let i = 0; i < text.length; i += 1) {
-        hash ^= BigInt(text.charCodeAt(i));
-        hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
-    }
-    return hash;
-}
-/** Murmur3 风格雪崩终混（64 位） */
-function murmurFinalize(x) {
-    let h = x;
-    h ^= h >> 33n;
-    h = (h * 0xff51afd7ed558ccdn) & 0xffffffffffffffffn;
-    h ^= h >> 33n;
-    h = (h * 0xc4ceb9fe1a85ec53n) & 0xffffffffffffffffn;
-    h ^= h >> 33n;
-    return h;
-}
-/**
- * 64 位双通道混合哈希：两个 32 位乘法通道（0x9E3779B1 / 0x5F356495）+ FNV 基底 + Murmur 雪崩。
- * 返回 16 位小写十六进制字符串。
- */
+/** 64 位双通道混合哈希（原文算法，逐字符 32 位乘法 + 交叉雪崩） */
 function hash64(text) {
     const input = String(text ?? '');
-    let h1 = 0xdeadbeef ^ input.length;
-    let h2 = 0x41c6ce57 ^ input.length;
+    let h1 = (0xdeadbeef ^ input.length) >>> 0;
+    let h2 = (0x41c64e6d ^ input.length) >>> 0;
     for (let i = 0; i < input.length; i += 1) {
         const code = input.charCodeAt(i);
-        h1 = Math.imul(h1 ^ code, 0x9e3779b1);
-        h2 = Math.imul(h2 ^ code, 0x5f356495);
-        h1 = (h1 << 13) | (h1 >>> 19);
-        h2 = (h2 << 13) | (h2 >>> 19);
+        h1 = Math.imul(h1 ^ code, 0x9e3779b1) >>> 0;
+        h2 = Math.imul(h2 ^ code, 0x5f356495) >>> 0;
     }
-    const combined = (BigInt(h1 >>> 0) << 32n) | BigInt(h2 >>> 0);
-    const mixed = murmurFinalize(combined ^ fnv1a64(input));
-    return mixed.toString(16).padStart(16, '0');
+    // 雪崩混合（MurmurHash 风格，两通道交叉）
+    h1 = (Math.imul(h1 ^ (h1 >>> 16), 0x85ebca6b) ^ Math.imul(h2 ^ (h2 >>> 13), 0xc2b2ae35)) >>> 0;
+    h2 = (Math.imul(h2 ^ (h2 >>> 16), 0x85ebca6b) ^ Math.imul(h1 ^ (h1 >>> 13), 0xc2b2ae35)) >>> 0;
+    return `${h2.toString(16).padStart(8, '0')}${h1.toString(16).padStart(8, '0')}`;
 }
 
 const VALID_OPS = new Set(['replace', 'delta', 'add', 'remove', 'move']);
@@ -276,6 +254,32 @@ function dueFields(meta, c, turnId) {
         }
     }
     return due;
+}
+/**
+ * Fast Demote（CFS real_takeover.js:320-331）：stable 字段本轮值变了 → 立即降 volatile
+ * （值改为进 L3 delta 暴露真实新值，而非 L1 STABLE_BATCH 引用）。
+ * thrash lock（默认 3 次）：同一字段反复降级达阈值 → 永久 volatile（抖动锁定）。
+ * 返回 { demoted, locked }。Slow Promote 不做自动（CFS 有，万花筒保留人工：
+ * learnFieldPools 建议 + 面板一键采纳——contractVersion+1 才改前缀，防止意外击穿缓存）。
+ */
+function stabilityDemotion(contract, changedPaths, demoteCounts, thrashLock = 3) {
+    const demoted = [];
+    const locked = [];
+    for (const path of changedPaths) {
+        const field = contract.updateRules[path];
+        if (!field || field.stability !== 'stable')
+            continue;
+        const count = (demoteCounts[path] ?? 0) + 1;
+        demoteCounts[path] = count;
+        if (count >= thrashLock) {
+            field.stability = 'volatile';
+            locked.push(path);
+            continue;
+        }
+        field.stability = 'volatile'; // Fast Demote：立即降级
+        demoted.push(path);
+    }
+    return { demoted, locked };
 }
 
 class DependencyCycleError extends Error {
@@ -952,8 +956,10 @@ function buildPrefixSegments(c, state, due, opts = {}) {
     return { segments, fingerprint };
 }
 /**
- * 最近剧情 squash（G7，§5.1）：取最近 N 条 → 同发件人相邻消息合并 → 去重。
- * 目的：L3 尾部长度受控、不随剧情累积膨胀，稳定 provider 前缀缓存。
+ * 最近剧情 squash（G7，§5.1/还原文档 §5）：取最近 N 条 → 全列表相邻同发件人消息合并 → 去重。
+ * 目的：L3 尾部长度受控、前缀字节稳定。
+ * （梦鲸审计修正：squash_nearby 不包裹 <observed_piece>——包裹仅 squash_into_one 的 g+y 段；
+ * 此处对齐 squash_nearby 语义：纯合并。）
  */
 function squashRecentStory(messages, maxMessages = 12) {
     const recent = messages.slice(-maxMessages * 3); // 取 3 倍窗口供合并
@@ -979,7 +985,25 @@ function squashRecentStory(messages, maxMessages = 12) {
 function buildTail(input) {
     const { contract, state, due, observation, activeEntries, recentStory, userInput, budget } = input;
     const lines = [];
-    // 1. 观察层字段（含静态值快照区：due 命中 static 字段的值行，§5.4）
+    // 0. Full Refresh 全量快照校准（CFS 审计项 8：每 K 轮把当前全量数据塞一份做完整快照，防长会话漂移）
+    if (input.fullRefresh) {
+        lines.push('<!-- NLKaleido Full Refresh: 全量 stat_data 快照（周期校准） -->');
+        lines.push('```json');
+        lines.push(JSON.stringify(state.stat_data));
+        lines.push('```');
+    }
+    // 1. 静态值快照区（§5.4/CFS 审计修正）：static+stable 字段的值**恒**呈现（fixed 永不到期，
+    //    若只按 due 命中呈现 Agent 将永远看不到它们；CFS 同义语义 = stable 值按 schema 理解）。
+    //    值未变 → 行字节恒定（前缀稳定）；值变 → 仅该行更新。
+    const staticFields = Object.values(contract.updateRules).filter((f) => fieldSlot(f) === 'l1_ref');
+    if (staticFields.length) {
+        lines.push('# 静态字段（值在契约层维护，STABLE_BATCH 仅引用）');
+        for (const field of staticFields) {
+            const value = hasAtPath(state.stat_data, field.path) ? getAtPath(state.stat_data, field.path) : undefined;
+            lines.push(value === undefined ? `${field.path}: (未设置)` : `${field.path}: ${JSON.stringify(value)}`);
+        }
+    }
+    // 2. 观察层字段（动态池增量；stable 本轮变化 → 此处暴露真实新值，CFS present→delta 语义）
     const fields = observation?.fields ?? due.map((path) => ({
         path,
         value: hasAtPath(state.stat_data, path) ? getAtPath(state.stat_data, path) : undefined,
@@ -1004,7 +1028,7 @@ function buildTail(input) {
         if (observation?.foldedSummary)
             lines.push(observation.foldedSummary);
     }
-    // 2. EJS activeEntries（M11；MVP 空集合，挂 L3 尾部槽位，§17.6）
+    // 3. EJS activeEntries（M11；MVP 空集合，挂 L3 尾部槽位，§17.6）
     if (activeEntries && activeEntries.size) {
         lines.push('# 已生效条目');
         for (const entry of activeEntries)
@@ -1203,7 +1227,8 @@ function validateOps(c, state, ops, turnId, opts = {}) {
                     rejected.push({ op, reason: 'delta 要求当前值为有限数值' });
                     continue;
                 }
-                const next = oldValue + op.value;
+                // 浮点卫生（MVU 教训 update_variables.ts:144/1353：toPrecision(12) 防累积误差）
+                const next = Number((oldValue + op.value).toPrecision(12));
                 const rangeError = checkRange(field, next);
                 if (rangeError) {
                     rejected.push({ op, reason: `range：${rangeError}` });
@@ -1334,7 +1359,8 @@ function applyOps(state, applied, turnId, opts = {}) {
             }
         }
         else if (op.op === 'delta') {
-            setAtPath(state.stat_data, op.path, old + op.value);
+            // 浮点卫生（MVU 教训：toPrecision(12) 防累积误差）
+            setAtPath(state.stat_data, op.path, Number((old + op.value).toPrecision(12)));
         }
         else if (op.op === 'remove') {
             removeAtPath(state.stat_data, op.path);
@@ -1462,6 +1488,8 @@ class PredicateParser {
     tokens;
     state;
     pos = 0;
+    depth = 0;
+    static MAX_DEPTH = 5; // 嵌套深度上限（§17.14-S2：防递归膨胀）
     constructor(tokens, state) {
         this.tokens = tokens;
         this.state = state;
@@ -1481,13 +1509,21 @@ class PredicateParser {
         return value;
     }
     parseOr() {
-        let left = this.parseAnd();
-        while (this.peek().kind === 'op' && this.peek().value === '||') {
-            this.next();
-            const right = this.parseAnd();
-            left = left || right;
+        this.depth += 1;
+        if (this.depth > PredicateParser.MAX_DEPTH)
+            throw new Error(`谓词嵌套超过 ${PredicateParser.MAX_DEPTH} 层`);
+        try {
+            let left = this.parseAnd();
+            while (this.peek().kind === 'op' && this.peek().value === '||') {
+                this.next();
+                const right = this.parseAnd();
+                left = left || right;
+            }
+            return left;
         }
-        return left;
+        finally {
+            this.depth -= 1;
+        }
     }
     parseAnd() {
         let left = this.parseUnary();
@@ -1623,6 +1659,53 @@ function checkInvariants(c, state) {
  * - pending 管理（§7 meta.pending）：addPending / resolvePending。
  * - replay：checkpoint + log 重放（恢复基底，§4.4.1 降级策略 1 的纯函数面）。
  */
+const DEFAULT_CHANGELOG_CONFIG = Object.freeze({
+    checkpointInterval: 50,
+    checkpointIntervalHours: 24,
+    checkpointLogSizeKB: 100,
+    maxLogEntries: 1000,
+    replayMaxEntries: 5000,
+});
+/** 未归档 log 的序列化大小（KB）——自最近 checkpoint 之后的条目；无未归档条目返回 0 */
+function logSizeKB(state) {
+    const lastCheckpointSeq = state.checkpoints.at(-1)?.seq ?? 0;
+    const pending = state.changelog.filter((e) => e.seq > lastCheckpointSeq);
+    if (!pending.length)
+        return 0;
+    return JSON.stringify(pending).length / 1024;
+}
+/** checkpoint 触发判定（§4.4.1 伪代码，纯函数）：满 50 轮 / 满 24h / 未归档 log ≥100KB，先到先触发 */
+function shouldCheckpoint(state, now, config = DEFAULT_CHANGELOG_CONFIG) {
+    const last = state.checkpoints.at(-1);
+    if (!last) {
+        // 无 checkpoint：以 log 量或轮数为准（首份 checkpoint 允许提前建立）
+        return logSizeKB(state) >= config.checkpointLogSizeKB || state.changelog.length >= config.maxLogEntries;
+    }
+    const rounds = state.revision.seq - last.seq;
+    const hours = (now - last.createdAt) / 3600e3;
+    const sizeKB = logSizeKB(state);
+    return rounds >= config.checkpointInterval || hours >= config.checkpointIntervalHours || sizeKB >= config.checkpointLogSizeKB;
+}
+/** 建立 full checkpoint（stat_data + meta 完整快照，§4.4.1 checkpointFull；shujuku 审计修正） */
+function makeCheckpoint(state, reason, now = Date.now()) {
+    state.checkpoints.push({
+        seq: state.revision.seq,
+        reason,
+        stat_data: structuredClone(state.stat_data),
+        meta: structuredClone(state.meta),
+        createdAt: now,
+    });
+}
+/** 裁剪 changelog：超 maxLogEntries 触发 checkpoint 后裁最旧（§4.4.1 maxLogEntries） */
+function trimChangelog(state, config = DEFAULT_CHANGELOG_CONFIG, now = Date.now()) {
+    if (state.changelog.length > config.maxLogEntries) {
+        makeCheckpoint(state, 'periodic', now);
+    }
+    const lastCheckpointSeq = state.checkpoints.at(-1)?.seq ?? 0;
+    // 只保留 checkpoint 之后的 log；再按条数上限裁剪最旧（保留最近 maxLogEntries 条）
+    const afterCheckpoint = state.changelog.filter((e) => e.seq > lastCheckpointSeq);
+    state.changelog = afterCheckpoint.slice(-config.maxLogEntries);
+}
 // ============================================================
 // 单条回滚（§4.4 / §9.1 面板单条回滚）
 // ============================================================
@@ -1717,6 +1800,8 @@ function writeValue(state, path, value) {
  *
  * 纯编排：所有 IO（发请求 / 读工具结果）经注入的 transport，可单测。
  */
+/** 失败反馈截断上限（shujuku 审计 SQL_ERROR_MARKER：截断-替换注入，防撑爆重试上下文） */
+const FEEDBACK_MAX_CHARS = 2000;
 /**
  * 单次模式：一步 agent 回合（§0.1-A 默认形态）。
  * 主链路：dueFields → observe → buildPrefixSegments/buildTail → request →
@@ -1726,7 +1811,8 @@ function writeValue(state, path, value) {
 async function runSingleShotAgent(transport, opts) {
     const { contract, state, turnId } = opts;
     const result = {
-        requested: false, applied: [], rejected: [], pending: [], retries: 0, usage: undefined, failureReasons: [],
+        requested: false, applied: [], rejected: [], pending: [], retries: 0, usage: undefined,
+        failureReasons: [], frozenDrift: [], demoted: [], thrashLocked: [],
     };
     // 1. 本轮到期字段（agent 决策范围）
     const due = dueFields(state.meta, contract, turnId);
@@ -1737,7 +1823,8 @@ async function runSingleShotAgent(transport, opts) {
     // 3. 观察层（§3.6 状态投影 + 可见性控制）
     const pendingPaths = state.meta.pending.map((p) => ({ op: p.op, rationale: p.rationale, reason: p.reason }));
     const observation = observe(contract, state, due, deps, pendingPaths, opts.observationOpts);
-    // 4. 前缀 + 尾部（§5.1 L0-L3）
+    // 4. 前缀 + 尾部（§5.1 L0-L3；Full Refresh 全量快照校准，CFS 审计项 8）
+    const fullRefreshEveryN = opts.fullRefreshEveryN ?? 0;
     const { segments } = buildPrefixSegments(contract, state, due, { l0: opts.l0 });
     const tail = buildTail({
         contract,
@@ -1747,6 +1834,7 @@ async function runSingleShotAgent(transport, opts) {
         recentStory: opts.recentStory,
         userInput: opts.userInput,
         budget: contract.guardrails.maxStatusTokens,
+        fullRefresh: fullRefreshEveryN > 0 && turnId % fullRefreshEveryN === 0,
     });
     const messages = [...segments.map((s) => ({ role: 'system', content: s.content })), ...tail];
     const maxRetries = contract.guardrails.maxRetries;
@@ -1754,9 +1842,10 @@ async function runSingleShotAgent(transport, opts) {
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
         result.requested = true;
         result.retries = attempt;
-        // 失败原因喂回（§3.4-D：自纠重试）
-        const requestMessages = feedback.length
-            ? [...messages, { role: 'system', content: `上一轮更新失败，请修正后重试：\n${feedback.join('\n')}` }]
+        // 失败原因喂回（§3.4-D：自纠重试）；截断防撑爆上下文（shujuku 审计 SQL_ERROR_MARKER）
+        const feedbackText = feedback.join('\n');
+        const requestMessages = feedbackText
+            ? [...messages, { role: 'system', content: `上一轮更新失败，请修正后重试：\n${feedbackText.slice(0, FEEDBACK_MAX_CHARS)}` }]
             : messages;
         const response = await transport.requestVariableUpdate(requestMessages, opts.jsonSchema ?? {});
         result.usage = response.usage;
@@ -1774,6 +1863,20 @@ async function runSingleShotAgent(transport, opts) {
         // 7. 应用 + changelog
         applyOps(state, gated, turnId, { source: 'agent' });
         result.applied.push(...gated);
+        // 8. 稳定性演化（CFS Fast Demote）+ frozen drift 上报
+        const changedPaths = new Set(gated.map((op) => op.path));
+        for (const path of changedPaths) {
+            const field = contract.updateRules[path];
+            if (field?.stability === 'frozen')
+                result.frozenDrift.push(path); // frozen 变化 → drift（injection_strategy.js:619-627）
+        }
+        const demotion = stabilityDemotion(contract, changedPaths, state.meta.stabilityDemotions ?? (state.meta.stabilityDemotions = {}));
+        result.demoted.push(...demotion.demoted);
+        result.thrashLocked.push(...demotion.locked);
+        // 9. changelog 两段式维护（shujuku 审计：生产路径接线；checkpoint 三触发条件）
+        if (shouldCheckpoint(state, Date.now()))
+            makeCheckpoint(state, 'periodic');
+        trimChangelog(state);
         // 低置信 → pending（§4.2 低置信不写）
         if (lowConfidence.length) {
             const created = addPending(state, lowConfidence, turnId, '低置信');
@@ -1783,7 +1886,7 @@ async function runSingleShotAgent(transport, opts) {
             result.rejected = [];
             break;
         }
-        // 8. 失败原因结构化 → 重试（默认 ≤1）
+        // 10. 失败原因结构化 → 重试（默认 ≤1）
         result.rejected = rejected;
         const reasons = rejected.map((r) => `- op[${r.op.op} ${r.op.path}]：${r.reason}`);
         result.failureReasons.push(...reasons);
@@ -1963,6 +2066,25 @@ const VREQ_MARKER = 'nlkaleido_vreq';
 /** 存储键（§4.2/§5.4：chat 层存 chat_metadata；run/global 层存 extension_settings.variables.global） */
 const STORE_KEY_CHAT = 'nlkaleido';
 const STORE_KEY_GLOBAL_PREFIX = 'nlkaleido:';
+/**
+ * commit 串行器（§17.14-S1：mutation 可并行 / commit 串行；shujuku 审计落地）。
+ * 面板编辑 / AI 更新 / 导入统一经此单一写入口排队；单条失败不阻塞队列，错误上浮供面板展示。
+ */
+class CommitQueue {
+    tail = Promise.resolve();
+    _lastError = null;
+    enqueue(task) {
+        const run = this.tail.then(task, task);
+        this.tail = run.catch(() => undefined);
+        return run;
+    }
+    get lastError() {
+        return this._lastError;
+    }
+    recordError(message) {
+        this._lastError = message;
+    }
+}
 class KaleidoStAdapter {
     globals;
     options;
@@ -1974,6 +2096,8 @@ class KaleidoStAdapter {
         lastStoryHash: null,
     };
     compat = null;
+    /** commit 串行器（§17.14-S1）：persistState 统一经此排队 */
+    commit = new CommitQueue();
     constructor(globals, options = {}) {
         this.globals = globals;
         this.options = options;
@@ -2118,13 +2242,28 @@ class KaleidoStAdapter {
     // ============================================================
     // usage 埋点（§10.2 readUsage，U5 字段口径）
     // ============================================================
-    /** 解析 usage → Metrics：PHit 数据由 MetricsStore 聚合（§5.7）；此处提取 hit/miss 字段 */
+    /**
+     * 解析 usage → Metrics（U5 + worldbook-manager 审计字段链）：
+     * hit 源优先级 prompt_cache_hit_tokens → cached_tokens → cachedContentTokenCount →
+     * cached_content_token_count → cache_read_input_tokens（monitor.ts:2130-2136）；
+     * miss 源 prompt_cache_miss_tokens → uncached_tokens → cache_creation_input_tokens，
+     * 缺失时 miss = max(0, promptTokens − hitTokens)（monitor.ts:2137-2149）。
+     */
     readUsage(data) {
         const usage = data?.usage;
         if (!usage || typeof usage !== 'object')
             return null;
         const promptTokens = Number(usage.prompt_tokens ?? 0);
-        Number(usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0);
+        const hitTokens = Number(usage.prompt_cache_hit_tokens
+            ?? usage.cached_tokens
+            ?? usage.cachedContentTokenCount
+            ?? usage.cached_content_token_count
+            ?? usage.cache_read_input_tokens
+            ?? 0);
+        Number(usage.prompt_cache_miss_tokens
+            ?? usage.uncached_tokens
+            ?? usage.cache_creation_input_tokens
+            ?? Math.max(0, promptTokens - hitTokens));
         const completionTokens = Number(usage.completion_tokens ?? 0);
         return {
             prefixFingerprint: '',
@@ -2136,9 +2275,94 @@ class KaleidoStAdapter {
             costUsd: 0,
         };
     }
+    /** 提取 hit/miss token 对（MetricsStore 聚合 PHit = Σhit/(Σhit+Σmiss)，WBM 口径） */
+    extractHitMiss(metrics) {
+        if (!metrics)
+            return { hitTokens: 0, missTokens: 0 };
+        const hit = Number(metrics.usage?.['prompt_cache_hit_tokens'] ?? metrics.usage?.['cached_tokens'] ?? 0);
+        const miss = Number(metrics.usage?.['prompt_cache_miss_tokens']
+            ?? metrics.usage?.['uncached_tokens']
+            ?? Math.max(0, metrics.promptTokens - hit));
+        return { hitTokens: hit, missTokens: miss };
+    }
     // ============================================================
-    // 多步模式（§10.2/§10.4：工具注册 + 循环 + 清理）
+    // G3 提示词查看器式提取（格式补全 §3.4：generate → SETTINGS_READY 截停拿真实 messages）
     // ============================================================
+    /**
+     * 提取当前正文请求的最终 messages（G3，§10.2 extractCurrentPrompt）：
+     * generate('normal') → SETTINGS_READY 拿最终 messages → stopGeneration() 截停（默认 30s 超时）。
+     * 用途：探明实验（U2/U3）、变量请求上下文的备选来源（CacheStrategy/AgentAdapter 可替换承载）。
+     */
+    async extractCurrentPrompt(timeoutMs = 30000) {
+        const context = this.globals.getContext();
+        if (typeof context.generate !== 'function' || typeof context.stopGeneration !== 'function') {
+            throw new Error('extractCurrentPrompt 需要 generate/stopGeneration（detectVersion 未覆盖）');
+        }
+        const eventSource = context.eventSource;
+        const settingsReady = context.eventTypes.CHAT_COMPLETION_SETTINGS_READY;
+        return new Promise((resolve, reject) => {
+            let done = false;
+            const handler = (data) => {
+                if (done)
+                    return;
+                done = true;
+                cleanup();
+                context.stopGeneration();
+                resolve((data?.messages ?? []));
+            };
+            const cleanup = () => {
+                eventSource.off?.(settingsReady, handler);
+                clearTimeout(timer);
+            };
+            const timer = setTimeout(() => {
+                if (done)
+                    return;
+                done = true;
+                cleanup();
+                context.stopGeneration();
+                reject(new Error(`extractCurrentPrompt 超时（${timeoutMs}ms）`));
+            }, timeoutMs);
+            eventSource.on(settingsReady, handler);
+            Promise.resolve(context.generate('normal'))
+                .then(() => {
+                if (!done) {
+                    done = true;
+                    cleanup();
+                    reject(new Error('未能提取提示词（生成先于 SETTINGS_READY 完成）'));
+                }
+            })
+                .catch((error) => {
+                if (!done) {
+                    done = true;
+                    cleanup();
+                    reject(error instanceof Error ? error : new Error(String(error)));
+                }
+            });
+        });
+    }
+    // ============================================================
+    // G4 intercept_anchor 注入（格式补全 §3.2：不新增消息条数，前缀更稳）
+    // ============================================================
+    /**
+     * 锚点后拦截注入（G4，§10.2 intercept_anchor）：变量任务提示词插入末尾 user 消息锚点之后，
+     * 消息条数不变 → 前缀缓存更稳。找不到锚点/末条非 user → 追加新 user 消息（保守降级）。
+     */
+    injectAtAnchor(messages, content, anchorRegex) {
+        const last = messages.at(-1);
+        if (!last || last.role !== 'user') {
+            return [...messages, { role: 'user', content }];
+        }
+        const match = findLastMatch(last.content, anchorRegex);
+        if (!match) {
+            return [...messages, { role: 'user', content }];
+        }
+        const next = [...messages];
+        next[next.length - 1] = {
+            ...last,
+            content: insertAt(last.content, match.index + match[0].length, content),
+        };
+        return next;
+    }
     registerMultiStepTools() {
         const context = this.globals.getContext();
         if (!this.adapter.toolsRegistered && typeof context.registerFunctionTool === 'function') {
@@ -2197,19 +2421,30 @@ class KaleidoStAdapter {
     // ============================================================
     // 存储（§10.2 persistState/loadState；U2/U6 结论）
     // ============================================================
-    async persistState(state) {
-        const meta = this.globals.getChatMetadata();
-        meta.variables = { ...(meta.variables ?? {}), [STORE_KEY_CHAT]: state };
-        this.globals.setChatMetadata(meta);
-        this.globals.saveChat(); // U2 补充：updateChatMetadata 只改内存，须自行落盘
-        // run/global 层（§16.1）：extension_settings.variables.global（U6 服务端 settings.json）
-        const ext = this.globals.getExtensionSettings();
-        const variables = (ext.variables ?? {});
-        const globals = (variables.global ?? {});
-        globals[`${STORE_KEY_GLOBAL_PREFIX}revision`] = { seq: state.revision.seq, hash: state.revision.hash, contractVersion: state.contractVersion };
-        variables.global = globals;
-        ext.variables = variables;
-        this.globals.saveSettings();
+    /** commit 串行化落盘（§17.14-S1 单写入口）：失败记录上浮（commit.lastError），不炸主链 */
+    persistState(state) {
+        return this.commit.enqueue(async () => {
+            try {
+                const meta = this.globals.getChatMetadata();
+                meta.variables = { ...(meta.variables ?? {}), [STORE_KEY_CHAT]: state };
+                this.globals.setChatMetadata(meta);
+                this.globals.saveChat(); // U2 补充：updateChatMetadata 只改内存，须自行落盘
+                // run/global 层（§16.1）：extension_settings.variables.global（U6 服务端 settings.json）
+                const ext = this.globals.getExtensionSettings();
+                const variables = (ext.variables ?? {});
+                const globals = (variables.global ?? {});
+                globals[`${STORE_KEY_GLOBAL_PREFIX}revision`] = { seq: state.revision.seq, hash: state.revision.hash, contractVersion: state.contractVersion };
+                variables.global = globals;
+                ext.variables = variables;
+                this.globals.saveSettings();
+                this.commit.recordError(null);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                this.commit.recordError(`落盘失败：${message}`);
+                console.error('[NLKaleido] persistState 失败：', error);
+            }
+        });
     }
     loadState() {
         const meta = this.globals.getChatMetadata();
@@ -2240,6 +2475,23 @@ class KaleidoStAdapter {
     storyHash(chat) {
         return hash64(chat.slice(-12).map((m) => m.mes ?? '').join('\n'));
     }
+}
+/** 最后一个匹配（格式补全 §3.6 P：g flag + 空匹配保护） */
+function findLastMatch(text, regex) {
+    const flags = regex.flags.includes('g') ? regex.flags : `${regex.flags}g`;
+    const global = new RegExp(regex.source, flags);
+    let last = null;
+    let match;
+    while ((match = global.exec(text)) !== null) {
+        if (match[0].length === 0)
+            global.lastIndex += 1; // 空匹配保护
+        last = match;
+    }
+    return last;
+}
+/** 在指定位置插入文本 */
+function insertAt(text, index, content) {
+    return `${text.slice(0, index)}${content}${text.slice(index)}`;
 }
 /**
  * 解析变量响应文本（G5 兜底）：
@@ -6366,6 +6618,7 @@ class KaleidoStateBridge {
             pending: state.meta.pending,
             revision: state.revision,
             lastTurnId: state.meta.lastTurnId,
+            persistError: this.adapter.commit.lastError, // §17.14-S1 落盘失败上浮（shujuku 审计）
         });
     }
     notifyPendingUpdated(state) {
@@ -19465,8 +19718,10 @@ const L0_TEMPLATE = [
     '1. 只修改本轮到期（due）或与你判断相关且你有权写入的字段；',
     '2. 输出严格 JSON：{"analysis":"...","json_patch":[{"op":"replace|delta|add|remove|move","path":"...","value":...,"confidence":"high|medium|low","rationale":"..."}]}；',
     '3. delta 只用于数值字段；replace 必须类型一致；不确定的更新给 low 置信度或省略；',
-    '4. <STABLE_BATCH> 引用的静态字段值在契约层维护，禁止推断/改写/猜测（§17.13-C2 元规则）；',
-    '5. 不输出 JSON 之外的任何内容。',
+    '4. <STABLE_BATCH> 引用的静态字段值在契约层维护：禁止凭对话上下文推断、改写或猜测；',
+    '5. 禁止把 <STABLE_BATCH> 标签复制到自己输出里；禁止给标签内任一字段「补一个新值」；',
+    '6. 只对真正改变的字段输出 op；稳定（stable）与冻结（frozen）字段保持沉默；',
+    '7. 不输出 JSON 之外的任何内容。',
 ].join('\n');
 // ============================================================
 // 触发（APP_READY auto-fire 覆盖「页面加载」与「运行中启用」两种路径）
