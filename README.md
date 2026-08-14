@@ -2,7 +2,9 @@
 
 契约约束下的 **Agent 变量托管系统**——正文生成结束后，变量 Agent 在契约护栏内自主维护角色卡状态（好感/关系/背包/世界阶段…），本地引擎负责调度、裁决、回滚与保护。前缀分片缓存（L0-L3）保证变量请求的 KV-Cache 命中，最大程度省钱。
 
-零依赖：不依赖 tavern-helper、不修改 ST 主仓库、运行时无任何 MVU 命令体系。
+在此基础上提供四个**作者可选、默认关闭**的平台能力：**长期记忆（M13）**、**剧情编排引擎（M15）**、**检定系统（M16）**、**MVU 存量卡迁移脚手架（M9）**，以及**玩家一键配置（M14，极简档零配置直用）**。
+
+零依赖：不依赖 tavern-helper、不修改 ST 主仓库、运行时无任何 MVU 命令体系、禁 eval/new Function。
 
 ## 安装（酒馆内）
 
@@ -13,11 +15,16 @@
 ## 使用
 
 - **玩家模式（默认）**：聊天正文生成结束后自动触发变量更新；面板状态板显示当前变量与待复核数量，开箱即用（需先在作者模式配置契约）。
-- **作者模式**：面板左上角切「作者模式」→
+- **作者模式**：面板左上角切「作者」→
   - **契约编辑器**：粘贴/编辑契约 JSON（字段 + 更新规则 + 护栏），保存即校验生效；
   - **预览**：状态表（full/summary/incremental）与观察层预览（Agent 本轮可见字段）；
   - **调试**：changelog diff / 单条回滚 / pending 接受或丢弃；
   - **导出**：一键下载 `{contract, stat_data, changelog}` 打包 JSON。
+- **记忆（M13）**：契约声明 `memory: { enabled: true }` → 反思写入（同一变量请求）+ BM25 检索 + L3 记忆段注入 + 遗忘状态机 + 记忆表（面板「记忆」页签浏览/手动归档/检索）。
+- **剧情（M15）**：契约声明 `plot: { enabled: true }` → 事件链状态机（本地骰子 + API 双驱）+ 风声系统 + 区域事件（面板「剧情」页签手动推进/停滞/终局）。
+- **检定（M16）**：契约声明 `dice: { enabled: true }` → roll/check/contest 检定引擎 + outcomes 结果分级 + AI 预设导入（tests 校验）+ 检定建议行（点击才执行，防奶人）。
+- **迁移（M9）**：面板「迁移」页签粘贴 MVU 老卡世界书条目与 ZOD 脚本 → 检测 → 解析 → 提取规则 → 生成契约初稿（难翻译构造显式标注，不静默丢弃）→ 导入。
+- **配置（M14）**：面板「配置」页签一键档位（极简/标准/进阶）+ 自动探测降级 + 连通性自检 + 快照回滚/恢复出厂。
 
 ### 契约最小示例
 
@@ -40,14 +47,17 @@
   },
   "displayRules": [{ "path": "角色.好感度", "render": "value" }],
   "guardrails": {},
-  "invariants": []
+  "invariants": [],
+  "memory": { "enabled": true, "tables": [{ "id": "profile", "name": "角色档案", "columns": ["名字", "*初登场"] }] },
+  "plot": { "enabled": true, "everyN": 5 },
+  "dice": { "enabled": true }
 }
 ```
 
 ## 运行时 API（作者扩展）
 
 `window.NLKaleido` 暴露：`getState()` / `getContract()` / `dispatch({action, ...})`。
-事件（经 ST eventSource）：`nlkaleido:status_changed` / `nlkaleido:pending_updated` / `nlkaleido:contract_changed` / `nlkaleido:metrics`。
+事件（经 ST eventSource）：`nlkaleido:status_changed` / `nlkaleido:pending_updated` / `nlkaleido:contract_changed` / `nlkaleido:metrics` / `nlkaleido:run_changed` / `nlkaleido:achievement_unlocked` / `nlkaleido:memory_changed` / `nlkaleido:plot_changed` / `nlkaleido:dice_rolled` / `nlkaleido:config_changed`。
 
 ## 技术说明
 
@@ -55,14 +65,16 @@
 - 结构化输出经 `CHAT_COMPLETION_SETTINGS_READY`（stringify 前最后一站）注入 `json_schema`，不传参以保留完整响应（含 usage）；
 - 触发锚点 = `GENERATION_ENDED`（覆盖成功/报错/中止/工具循环收尾），带消息完整性与中止标记双守卫；
 - 状态存 `chatMetadata.variables['nlkaleido']`（聊天级）；run/global 层存 `extensionSettings.variables.global['nlkaleido:*']`；
-- 全部设计文档见《万花筒交接稿.md》（§0-§24）。
+- 记忆/剧情/检定存 chat 层独立键（默认关闭零开销）；配置中心存 `nlkaleido:config`（F12 持久化，configVersion 自动迁移）；
+- **代码分包**：M9 迁移代码独立 chunk 按需加载，主 bundle 零迁移代码（默认关闭零开销为可测事实）；
+- 全部设计文档见《万花筒交接稿.md》（§0-§24）与《验收核对.md》。
 
 ## 构建（开发者）
 
 ```bash
 npm install
-npm test        # 198 测试
-npm run build   # tsc → rollup → release/dist/index.js
+npm test        # 394 测试
+npm run build   # tsc → rollup → release/dist/（index.js + chunks/）
 ```
 
 ## License
