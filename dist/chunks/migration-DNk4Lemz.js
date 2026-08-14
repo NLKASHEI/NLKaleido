@@ -1,4 +1,4 @@
-import { h as hash64 } from './entry-D4H47EQ0.js';
+import { h as hash64 } from './entry-BSIO7ML2.js';
 
 /**
  * M9 MVU 存量卡迁移脚手架（§24，作者可选、默认关闭；纯字符串扫描，禁 eval/new Function）。

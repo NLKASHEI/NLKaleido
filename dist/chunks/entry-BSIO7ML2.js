@@ -1748,6 +1748,10 @@ function rollbackEntry(state, seq) {
     const entry = state.changelog.find((e) => e.seq === seq);
     if (!entry)
         return { ok: false, error: `seq ${seq} 不存在` };
+    // 子系统审计记录（plot 账本等）不进 stat_data，不可回滚（§22.5 账本语义）
+    if (entry.source === 'plot' || entry.source === 'memory' || entry.source === 'dice') {
+        return { ok: false, error: `seq ${seq} 属 ${entry.source} 子系统审计记录，不可回滚` };
+    }
     // 防重复回滚：该 seq 之后已有针对它的 rollback
     const alreadyRolledBack = state.changelog.some((e) => e.seq > seq && e.source === 'rollback' && e.rationale === `rollback seq ${seq}`);
     if (alreadyRolledBack)
@@ -3309,6 +3313,12 @@ const PLOT_SETBACK_RATIO = 0.4;
 const PLOT_DICE_MODIFIER_DEFAULT = 0;
 /** 保底参数（:643-648）：conflict 6−Lv（≥1）；progress 2+Lv */
 const PLOT_FAIL_BASE = Object.freeze({ conflict: 6, progress: 2 });
+/** 正面终局保留轮数：base 2 + level×2（:66-70） */
+const PLOT_TERMINAL_KEEP_BASE = 2;
+const PLOT_TERMINAL_KEEP_PER_LEVEL = 2;
+/** 事件链上限（localCapEvents，api.js 默认 16） */
+const MAX_PLOT_EVENTS = 16;
+const PLOT_INFLUENCE_KEEP_ROUNDS = 8;
 function rollDice(randomFn) {
     return Math.floor(randomFn() * 100) + 1;
 }
@@ -3375,6 +3385,8 @@ function rollEventDice(input, options = {}) {
         const { promoted, terminalReached } = advanceStageRound(event);
         event.consecutiveFails = 0;
         event.evolveResult = '成功';
+        if (terminalReached)
+            event.terminalRound = options.round;
         return { event, result: '保底成功', threshold, dice: 0, promoted, terminalReached };
     }
     const dice = options.dice ?? rollDice(randomFn);
@@ -3382,6 +3394,8 @@ function rollEventDice(input, options = {}) {
         const { promoted, terminalReached } = advanceStageRound(event);
         event.consecutiveFails = 0;
         event.evolveResult = '成功';
+        if (terminalReached)
+            event.terminalRound = options.round;
         return { event, result: '成功', threshold, dice, promoted, terminalReached };
     }
     if (dice < threshold * setbackRatio) {
@@ -3394,6 +3408,104 @@ function rollEventDice(input, options = {}) {
     event.evolveResult = '保持';
     return { event, result: '保持', threshold, dice, promoted: false, terminalReached: false };
 }
+/** 正面终局保留轮数：2 + Lv×2（:66-70）；负面终局下轮即删（:1274-1295） */
+function terminalKeepRounds(event) {
+    return PLOT_TERMINAL_KEEP_BASE + (event.level || 1) * PLOT_TERMINAL_KEEP_PER_LEVEL;
+}
+/**
+ * 终局保留期维护（:1274-1295）：已消散/已失败 → 下一轮删除；
+ * 已爆发/已完成 → 保留 2+Lv×2 轮（余波铺陈）后删除；删除前进 terminalSnapshot 供账本记录。
+ */
+function maintainPlotEvents(events, round) {
+    const terminalSnapshot = [];
+    const kept = events.filter((event) => {
+        const terminalStages = PLOT_TERMINAL_STAGES[event.type] ?? PLOT_TERMINAL_STAGES.conflict;
+        if (!terminalStages.includes(event.stage))
+            return true; // 非终局保留
+        const isPositive = event.stage === PLOT_FINAL_STAGE[event.type];
+        const reached = event.terminalRound ?? round;
+        if (!isPositive) {
+            // 负面终局：下轮即删
+            if (round - reached >= 1) {
+                terminalSnapshot.push(event);
+                return false;
+            }
+            return true;
+        }
+        if (round - reached >= terminalKeepRounds(event)) {
+            terminalSnapshot.push(event);
+            return false;
+        }
+        return true;
+    });
+    return { events: kept, terminalSnapshot };
+}
+/** 影响链合并（:1221-1228：同 trigger 更新不堆叠；cap 12；更新不续期） */
+function mergeInfluences(existing, incoming, round) {
+    const merged = [...existing];
+    for (const item of incoming) {
+        if (!item || !item.trigger || !item.impact)
+            continue;
+        const index = merged.findIndex((e) => e.trigger === item.trigger);
+        const entry = {
+            trigger: item.trigger.slice(0, 50),
+            impact: item.impact.slice(0, 50),
+            fallout: item.fallout?.slice(0, 50),
+            // 更新不续期：保留原 createdRound
+            createdRound: index >= 0 ? merged[index].createdRound : (round ?? item.createdRound),
+        };
+        if (index >= 0)
+            merged[index] = entry;
+        else
+            merged.push(entry);
+    }
+    return merged.slice(-12);
+}
+/** 影响链过期清理（:1233-1247：createdRound 起保留 8 轮，更新不续期） */
+function maintainPlotInfluences(events, round) {
+    for (const event of events) {
+        if (!event.influences?.length)
+            continue;
+        event.influences = event.influences.filter((item) => {
+            if (item.createdRound === undefined)
+                return true;
+            return round - item.createdRound < PLOT_INFLUENCE_KEEP_ROUNDS;
+        });
+    }
+}
+/**
+ * 账本行生成（ledger.js:19-99 语义）：事件链普通变化只记 Lv≥3；任何等级终局都记；
+ * 风声仅「新增」Lv≥3 记 wind_new。返回人类可读行（写已有 changelog，source:'plot'）。
+ */
+function plotLedgerLines(before, after, windsBefore, windsAfter) {
+    const lines = [];
+    const beforeById = new Map(before.map((e) => [e.id, e]));
+    const windIdsBefore = new Set(windsBefore.map((w) => w.id));
+    for (const event of after) {
+        const previous = beforeById.get(event.id);
+        const terminalStages = PLOT_TERMINAL_STAGES[event.type] ?? PLOT_TERMINAL_STAGES.conflict;
+        const isTerminal = terminalStages.includes(event.stage);
+        const level = event.level || 1;
+        if (!previous) {
+            if (isTerminal || level >= 3)
+                lines.push(`event_new: ${event.name}（${event.type} Lv${level} · ${event.stage}）`);
+            continue;
+        }
+        if (isTerminal && previous.stage !== event.stage) {
+            lines.push(`event_terminal: ${event.name} → ${event.stage}`);
+            continue;
+        }
+        if (level >= 3 && previous.stage !== event.stage) {
+            lines.push(`event_advance: ${event.name} → ${event.stage}`);
+        }
+    }
+    for (const wind of windsAfter) {
+        if (!windIdsBefore.has(wind.id) && (wind.level ?? 1) >= 3) {
+            lines.push(`wind_new: [${wind.type}] ${wind.topic}`);
+        }
+    }
+    return lines;
+}
 /** 新事件 id：hash64(type:name) 截断 12 位（id:null → 新建的本地兜底 id） */
 function newEventId(name, type) {
     return `ev-${hash64(`${type}:${name}:${Date.now()}`).slice(0, 12)}`;
@@ -3405,7 +3517,7 @@ function newEventId(name, type) {
  * - API 可判定终局（含负面已消散/已失败）；stageRound ≥ 9 → 自动晋级；
  * - API 未给 stageRound → 沿用原值。
  */
-function applyApiEventUpdates(events, updates, now = Date.now()) {
+function applyApiEventUpdates(events, updates, now = Date.now(), round) {
     const result = [...events];
     const created = [];
     const terminated = [];
@@ -3414,6 +3526,13 @@ function applyApiEventUpdates(events, updates, now = Date.now()) {
             continue;
         const existing = update.id ? result.find((e) => e.id === update.id) : undefined;
         if (existing) {
+            // 终局事件保护（evolution.js:1153-1158）：终局只允许改 desc，其余字段一律忽略
+            const existingTerminal = PLOT_TERMINAL_STAGES[existing.type]?.includes(existing.stage);
+            if (existingTerminal) {
+                if (update.desc !== undefined)
+                    existing.desc = update.desc;
+                continue;
+            }
             if (update.name !== undefined)
                 existing.name = update.name;
             if (update.desc !== undefined)
@@ -3424,11 +3543,15 @@ function applyApiEventUpdates(events, updates, now = Date.now()) {
                 existing.stall = Boolean(update.stall);
             if (update.influenceChain !== undefined)
                 existing.influenceChain = update.influenceChain;
+            if (update.influences !== undefined) {
+                existing.influences = mergeInfluences(existing.influences ?? [], update.influences, round);
+            }
             if (update.stage !== undefined && update.stage !== existing.stage) {
                 existing.stage = update.stage;
                 // 终局锁定 9/9（:741）；负面终局同样锁定
                 if (PLOT_TERMINAL_STAGES[existing.type]?.includes(existing.stage)) {
                     existing.stageRound = 9;
+                    existing.terminalRound = round;
                     terminated.push(existing);
                 }
             }
@@ -3436,9 +3559,11 @@ function applyApiEventUpdates(events, updates, now = Date.now()) {
                 existing.stageRound = update.stageRound;
                 if (existing.stageRound >= 9) {
                     // API 写 9 → 本地自动晋级（:1161-1172）
-                    const { promoted } = advanceStageRound(existing);
+                    const { promoted, terminalReached } = advanceStageRound(existing);
                     if (promoted)
                         existing.stageRound = PLOT_TERMINAL_STAGES[existing.type]?.includes(existing.stage) ? 9 : 1;
+                    if (terminalReached)
+                        existing.terminalRound = round;
                     if (PLOT_TERMINAL_STAGES[existing.type]?.includes(existing.stage))
                         terminated.push(existing);
                 }
@@ -3463,13 +3588,19 @@ function applyApiEventUpdates(events, updates, now = Date.now()) {
                 desc: update.desc ?? '',
                 stall: update.stall,
                 influenceChain: update.influenceChain,
+                influences: update.influences ? mergeInfluences([], update.influences, round) : undefined,
                 consecutiveFails: 0,
+                terminalRound: isTerminal ? round : undefined,
             };
             if (isTerminal)
                 terminated.push(event);
             result.push(event);
             created.push(event);
         }
+    }
+    // 上限保护（localCapEvents 默认 16：保留最新 16 条，evolution.js:1140-1188 unshift 语义）
+    if (result.length > MAX_PLOT_EVENTS) {
+        result.splice(0, result.length - MAX_PLOT_EVENTS);
     }
     return { events: result, created, terminated };
 }
@@ -3619,6 +3750,10 @@ const WORLD_CONSTRAINT_TEMPLATE = [
     '2. 玩家全知 ≠ 主角全知：面板记录玩家可见的世界状态；角色只能依据亲眼所见、亲耳所闻、合法传播、调查或组织命令行动。',
     '3. 远处、隐秘、未传播的世界状态必须经风声、事件链、接触等合理路径才能进入角色认知；禁止把角色不该知道的状态塞进正文。',
     '4. 推演轮 ≠ 对话轮：每次推演先估计自上次以来的剧情时间；时间短 → 后台轻微反应；时间长 → 势力/经济/风声相称变化。',
+    '5. 黑盒铁律：无目击的私密行为不得生成风声、不得改变声誉、不得形成/推进事件链、不得让任何不在场 NPC 据此行动。',
+    '6. 痕迹不等于指向：物证只能证明发生了什么，不能自动证明是谁做的；匿名/化名/伪装身份默认身份隔离。',
+    '7. 合法获知路径（必须能回答「它通过什么路径知道」）：亲历 / 知情者告知 / 公开渠道 / 风声覆盖 / 组织情报网 / 物证调查 / 世界内通讯手段；答不上来 = 不知道。',
+    '8. 特权修正：受害者地位/权力高于玩家 → 事件定级跃升（顶撞权贵=重罪；冒犯皇室起步 Lv3-4）；玩家地位远高 → 可压级。',
 ].join('\n');
 /** 感知边界注入：事件链/风声文本摘要（只进 L3 玩家可见段；由调用方决定内容） */
 function renderPlotSegment(events, winds) {
@@ -3657,6 +3792,20 @@ function buildWorldEvolutionSchema() {
                             stageRound: { type: 'integer', minimum: 1, maximum: 9 },
                             desc: { type: 'string', description: '不超过 50 汉字' },
                             stall: { type: 'boolean' },
+                            influences: {
+                                type: 'array',
+                                description: '影响链传导（跨系统外溢才记录）：什么触发 → 直接改变了什么 → 后续余波',
+                                maxItems: 12,
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        trigger: { type: 'string', description: '不超过 50 汉字' },
+                                        impact: { type: 'string', description: '不超过 50 汉字，必须已发生' },
+                                        fallout: { type: 'string', description: '不超过 50 汉字，进一步扩散趋势' },
+                                    },
+                                    required: ['trigger', 'impact'],
+                                },
+                            },
                         },
                         required: ['id', 'name', 'type'],
                     },
@@ -4532,6 +4681,7 @@ class KaleidoStAdapter {
         plotWinds: [],
         regionalIncident: { active: null, cooldown: 0 },
         plotRequestInFlight: false,
+        plotRound: 0,
         dicePresets: [],
         diceHistory: [],
         config: tierDefaults('minimal'),
@@ -4611,9 +4761,10 @@ class KaleidoStAdapter {
         // M15 剧情编排（§22：作者声明才启用；未启用 → 零剧情路径）
         const plotEnabled = contract.plot?.enabled === true;
         const plotStates = plotEnabled ? renderPlotSegment(this.adapter.plotEvents, this.adapter.plotWinds) : undefined;
-        // §22.4 感知边界：只注入角色可合法感知的世界状态（终局/Lv≥3 事件 + 全部风声）
+        // §22.4 感知边界：只注入角色可合法感知的世界状态
+        // （world-engine-inject.js:97-136：事件 Lv≥3 全注入 / Lv1-2 仅终局注入；风声 Lv≥3 才注入）
         const plotSegment = plotEnabled
-            ? renderPlotSegment(this.adapter.plotEvents.filter((e) => (PLOT_TERMINAL_STAGES[e.type] ?? []).includes(e.stage) || (e.level ?? 1) >= 3), this.adapter.plotWinds) || null
+            ? renderPlotSegment(this.adapter.plotEvents.filter((e) => (PLOT_TERMINAL_STAGES[e.type] ?? []).includes(e.stage) || (e.level ?? 1) >= 3), this.adapter.plotWinds.filter((w) => (w.level ?? 1) >= 3)) || null
             : null;
         const l0 = plotEnabled
             ? `${this.options.l0Template ?? ''}\n\n${contract.plot?.worldConstraints ?? WORLD_CONSTRAINT_TEMPLATE}`
@@ -4699,11 +4850,20 @@ class KaleidoStAdapter {
     runPlotDice(contract) {
         const modifier = contract.plot?.diceModifier ?? PLOT_DICE_MODIFIER_DEFAULT;
         const setbackRatio = contract.plot?.setbackRatio ?? PLOT_SETBACK_RATIO;
+        this.adapter.plotRound += 1;
+        const round = this.adapter.plotRound;
+        const eventsBefore = this.adapter.plotEvents.map((e) => ({ ...e }));
+        const windsBefore = this.adapter.plotWinds.map((w) => ({ ...w }));
         const events = this.adapter.plotEvents;
         for (let i = 0; i < events.length; i += 1) {
-            const outcome = rollEventDice(events[i], { modifier, setbackRatio });
+            const outcome = rollEventDice(events[i], { modifier, setbackRatio, round });
             events[i] = outcome.event;
         }
+        // 终局保留期维护（evolution.js:1274-1295：负面终局下轮即删；正面终局保留 2+Lv×2 轮）
+        const maintained = maintainPlotEvents(events, round);
+        this.adapter.plotEvents = maintained.events;
+        // 影响链过期清理（:1233-1247 保留 8 轮不续期）
+        maintainPlotInfluences(this.adapter.plotEvents, round);
         if (contract.plot?.winds !== false) {
             const { survivors, decayed } = decayWinds(this.adapter.plotWinds);
             this.adapter.plotWinds = survivors;
@@ -4719,6 +4879,37 @@ class KaleidoStAdapter {
             if (started || ended)
                 this.onPlotChanged?.();
         }
+        // 账本（ledger.js:19-99：Lv≥3 变化 / 任何终局 / 新增 Lv≥3 风声 → 写已有 changelog，source:'plot'）
+        const terminalLines = maintained.terminalSnapshot.map((e) => `event_terminal_cleanup: ${e.name} → ${e.stage}`);
+        const ledgerLines = [
+            ...plotLedgerLines(eventsBefore, this.adapter.plotEvents, windsBefore, this.adapter.plotWinds),
+            ...terminalLines,
+        ];
+        if (ledgerLines.length)
+            this.appendPlotLedger(ledgerLines);
+    }
+    /** 剧情账本写入 changelog（source:'plot' 审计记录；不进 stat_data，rollbackEntry 已守卫） */
+    appendPlotLedger(lines) {
+        const state = this.adapter.state;
+        if (!state)
+            return;
+        for (const line of lines) {
+            state.revision = {
+                seq: state.revision.seq + 1,
+                hash: hash64(`${line}|${state.revision.seq}`),
+                updatedAt: Date.now(),
+            };
+            state.changelog.push({
+                seq: state.revision.seq,
+                turnId: state.meta.lastTurnId,
+                path: '$plot',
+                op: { op: 'replace', path: '$plot', value: line, confidence: 'high', rationale: '剧情账本' },
+                old: undefined,
+                new: line,
+                confidence: 'high',
+                source: 'plot',
+            });
+        }
     }
     /**
      * 世界推演请求（双驱之二，§22.3：复用变量通道 + jsonSchema {events,winds}；
@@ -4733,6 +4924,9 @@ class KaleidoStAdapter {
             if (typeof context.generateRawData !== 'function')
                 return;
             const stateText = renderPlotSegment(this.adapter.plotEvents, this.adapter.plotWinds);
+            const eventsBefore = this.adapter.plotEvents.map((e) => ({ ...e }));
+            const windsBefore = this.adapter.plotWinds.map((w) => ({ ...w }));
+            const round = this.adapter.plotRound;
             const prompt = [
                 { role: 'system', name: VREQ_MARKER, content: '' },
                 {
@@ -4740,7 +4934,10 @@ class KaleidoStAdapter {
                     content: [
                         '你是世界推演引擎。根据最近剧情推演世界状态：事件链（events）与风声（winds）只输出本轮有实质变化的字段。',
                         '规则：同一事项（目标/矛盾/持续行动）沿用原 id 更新，不得拆成新事件；只有可独立演化的新冲突/推进才以 id:null 新建。',
-                        'type 一旦确定禁止改动；负面终局（已消散/已失败）只能由你根据明确因果判定；正面终局（已爆发/已完成）可直接给出。',
+                        'type 一旦确定禁止改动；终局不可逆，已终局事件只允许改 desc；负面终局（已消散/已失败）只能由你根据明确因果判定（物理阻断/能力不足/信息断裂/资源耗尽/被反制/时间过期）；仅仅连续多轮没进展不足以判定终局；正面终局（已爆发/已完成）可直接给出。',
+                        '特权修正：受害者地位高于玩家 → 定级跃升；玩家地位远高 → 可压级。',
+                        '因果检查：无目击的私密行为不得生成风声/声誉/事件链；物证不等于指向；NPC 必须能回答「通过什么路径知道」。',
+                        '影响链（influences）只记录真实跨系统外溢：trigger 触发 → impact 已发生 → fallout 扩散趋势。',
                         `${contract.plot?.worldConstraints ?? WORLD_CONSTRAINT_TEMPLATE}`,
                         stateText ? `# 当前世界状态\n${stateText}` : '# 当前世界状态\n（无）',
                         '# 最近剧情',
@@ -4757,13 +4954,17 @@ class KaleidoStAdapter {
                 if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
                     const record = parsed;
                     if (Array.isArray(record.events)) {
-                        const { events } = applyApiEventUpdates(this.adapter.plotEvents, record.events);
+                        const { events } = applyApiEventUpdates(this.adapter.plotEvents, record.events, Date.now(), round);
                         this.adapter.plotEvents = events;
                     }
                     if (Array.isArray(record.winds) && contract.plot?.winds !== false) {
                         const { winds } = applyApiWindUpdates(this.adapter.plotWinds, record.winds);
                         this.adapter.plotWinds = winds;
                     }
+                    // 账本（Lv≥3 变化 / 任何终局 / 新增 Lv≥3 风声 → changelog，source:'plot'）
+                    const ledgerLines = plotLedgerLines(eventsBefore, this.adapter.plotEvents, windsBefore, this.adapter.plotWinds);
+                    if (ledgerLines.length)
+                        this.appendPlotLedger(ledgerLines);
                     await this.persistPlotState();
                     this.onPlotChanged?.();
                 }
@@ -4785,6 +4986,7 @@ class KaleidoStAdapter {
             events: this.adapter.plotEvents,
             winds: this.adapter.plotWinds,
             regionalIncident: this.adapter.regionalIncident,
+            plotRound: this.adapter.plotRound,
         };
         return this.commit.enqueue(async () => {
             const meta = this.globals.getChatMetadata();
@@ -4800,13 +5002,15 @@ class KaleidoStAdapter {
         this.adapter.plotEvents = Array.isArray(stored?.events) ? stored.events : [];
         this.adapter.plotWinds = Array.isArray(stored?.winds) ? stored.winds : [];
         this.adapter.regionalIncident = stored?.regionalIncident ?? { active: null, cooldown: 0 };
-        return { events: this.adapter.plotEvents, winds: this.adapter.plotWinds, regionalIncident: this.adapter.regionalIncident };
+        this.adapter.plotRound = typeof stored?.plotRound === 'number' ? stored.plotRound : 0;
+        return { events: this.adapter.plotEvents, winds: this.adapter.plotWinds, regionalIncident: this.adapter.regionalIncident, plotRound: this.adapter.plotRound };
     }
     /** 新周目：世界推演状态重置（§22.7 GlobalHook 语义；chat 层随周目重开） */
     resetChatPlot() {
         this.adapter.plotEvents = [];
         this.adapter.plotWinds = [];
         this.adapter.regionalIncident = { active: null, cooldown: 0 };
+        this.adapter.plotRound = 0;
         this.onPlotChanged?.();
     }
     // ============================================================
@@ -22944,7 +23148,7 @@ const MigrationView = defineComponent({
             busy.value = true;
             try {
                 // 动态 import：迁移代码独立 chunk，默认关闭主 bundle 不含（§24.1 代码分包）
-                const migration = await import('./migration-CxIVkZCZ.js');
+                const migration = await import('./migration-DNk4Lemz.js');
                 let worldbookEntries = [];
                 let scripts = [];
                 try {
