@@ -8379,6 +8379,13 @@ const SECTION_RULES = {
         '禁止输出 _.xxx()、eval、new Function、模板执行代码或 [mvu_update] 运行逻辑；它们只能作为不可执行的迁移证据被概述。',
     ],
 };
+const SECTION_WRITE_SCOPE = {
+    fields: '只允许修改 schema、updateRules、displayRules、invariants；ejs、memory、plot、dice、guardrails 和身份字段必须与当前契约逐字义等价。',
+    ces: '只允许修改 ejs；确实缺少条件变量时才可最小新增 updateRules/displayRules，其他字段必须保持不变。',
+    dice: '只允许修改 dice；其余全部字段必须保持不变。',
+    systems: '只允许修改 memory、plot、dice；其余全部字段必须保持不变。',
+    migration: '允许修复完整契约，但必须保留确定性迁移得到的全部变量、原规则证据和需人工确认标记。',
+};
 /**
  * “AI 帮帮”专用创作 Skill。它不是泛化聊天提示，而是一套可审计的契约设计流程：
  * 需求拆解 → 最小变量集 → 更新证据 → 可视化默认值 → 世界书联动 → 可选系统。
@@ -8393,6 +8400,8 @@ function buildAuthorSkillPrompt(input) {
         '你的工作是把作者需求变成“少而够用、能直接检查、能通过校验”的完整契约草稿。只输出 JSON（一个完整 Contract 对象），不输出 Markdown、解释或额外包裹。',
         '',
         `## 当前工作板块：${section}`,
+        `写入白名单：${SECTION_WRITE_SCOPE[section]}`,
+        '这是硬约束。输出前必须比较当前契约；白名单之外的字段不得因“顺手优化”、风格统一或模型偏好而变化。',
         ...SECTION_RULES[section].map((rule, index) => `${index + 1}. ${rule}`),
         '',
         '## 必须执行的设计步骤',
@@ -8402,7 +8411,7 @@ function buildAuthorSkillPrompt(input) {
         '4. reviewRequired 默认 true。除非作者明确要求后台隐藏，否则 display=true。',
         '5. 只有下面“可用世界书条目”中真实存在的世界书和条目才能写入 ejs；不得编造名称。作者要求联动但没有匹配条目时，保留 ejs 为空，不要猜。',
         '6. ejs 条件优先使用简单 var 比较，entryPlacement 必须是 l3_tail；一条规则只表达一个清晰条件。',
-        '7. 作者提到跨轮事实、幕后世界发展或检定时，分别启用 memory、plot、dice；没有提到则保持关闭，避免额外开销。',
+        '7. 只有当前板块的写入白名单允许时，才可根据明确需求启用 memory、plot、dice；没有提到则保持关闭，避免额外开销。',
         '8. 必须保留完整 Contract 外形：version、id、schema、updateRules、displayRules、guardrails、invariants；不要加入脚本、eval、模板代码。',
         '9. 输出前自行逐项检查：字段 path 唯一、类型与 default 一致、依赖均已声明、ejs 只引用真实条目、关闭功能不产生额外配置。',
         '10. 不得把“建议作者以后填写”当作结果；能从需求确定的内容必须实际写入 JSON，不能确定的内容保持原值或明确标注需人工确认。',
@@ -8437,7 +8446,7 @@ function buildAuthorSkillPrompt(input) {
  */
 function minimalConfigFallback() {
     return {
-        configVersion: 2, tier: 'minimal', storage: 'memory', retrieval: 'bm25',
+        configVersion: 3, tier: 'minimal', storage: 'memory', retrieval: 'bm25',
         memory: { maxAtoms: 300, injectTopK: 5, archiveThreshold: 50, archiveBatchSize: 3 },
         resources: { maxVectorDims: 1024, maxMemoryTokens: 800 },
         primaryAi: { mode: 'sillytavern', baseUrl: '', apiKey: '', model: '', timeoutMs: 60_000 },
@@ -8552,7 +8561,7 @@ class KaleidoStAdapter {
     async ensureConfigModule() {
         if (this.configModule)
             return this.configModule;
-        this.configModulePromise ??= import('./chunks/config-BfCYuCPD.js');
+        this.configModulePromise ??= import('./chunks/config-9EQ_b8MG.js');
         this.configModule = await this.configModulePromise;
         return this.configModule;
     }
@@ -8972,7 +8981,8 @@ class KaleidoStAdapter {
         const recentStory = this.extractRecentStory(chat);
         const userInput = this.extractUserInput(chat);
         // M13 记忆（§20：作者声明才启用；未启用 → memoryStore 不传 → 运行时零记忆路径）
-        const memoryEnabled = contract.memory?.enabled === true;
+        const optionalSystemsAvailable = this.adapter.config.tier !== 'minimal';
+        const memoryEnabled = optionalSystemsAvailable && contract.memory?.enabled === true;
         const memoryApi = memoryEnabled ? await this.ensureMemoryModule() : null;
         const reflectionEveryN = contract.memory?.reflectionEveryN ?? memoryApi?.REFLECTION_EVERY_N_TURNS ?? 10;
         const reflectionDue = memoryEnabled && turnId % reflectionEveryN === 0;
@@ -8983,7 +8993,7 @@ class KaleidoStAdapter {
             ? await this.renderRelevantMemory(memoryQuery, contract.guardrails.maxStatusTokens, contract.memory?.injectTopK ?? 5)
             : null;
         // M15 剧情编排（§22：作者声明才启用；未启用 → 零剧情路径）
-        const plotEnabled = contract.plot?.enabled === true;
+        const plotEnabled = optionalSystemsAvailable && contract.plot?.enabled === true;
         const plotStates = plotEnabled ? renderPlotSegment(this.adapter.plotEvents, this.adapter.plotWinds) : undefined;
         // §22.4 感知边界：只注入角色可合法感知的世界状态
         // （§22.4 感知边界：事件 Lv≥3 全注入 / Lv1-2 仅终局注入；风声 Lv≥3 才注入）
@@ -8997,7 +9007,9 @@ class KaleidoStAdapter {
         // 作者契约仍负责变量规则与每步 token 护栏，但不可以强迫玩家承担额外 RPM。
         // ST 工具按回合注册，并由 finally 保证模型报错/切聊天/中止时也不会残留到正文生成。
         let result = null;
-        const configuredRequests = this.adapter.config.agent?.maxRequestsPerTurn ?? 1;
+        const configuredRequests = this.adapter.config.tier === 'minimal'
+            ? 1
+            : this.adapter.config.agent?.maxRequestsPerTurn ?? 1;
         const maxRequestsPerTurn = Math.max(1, Math.min(8, Math.floor(configuredRequests)));
         if (maxRequestsPerTurn > 1) {
             this.registerMultiStepTools();
@@ -9309,7 +9321,7 @@ class KaleidoStAdapter {
      * 以 API 返回为准改写 stage/stageRound；异步 fire-and-forget，失败静默不阻塞主链）。
      */
     async runWorldEvolution(contract, recentStory = [], userInput = '') {
-        if (this.adapter.plotRequestInFlight || !contract.plot?.enabled)
+        if (this.adapter.config.tier === 'minimal' || this.adapter.plotRequestInFlight || !contract.plot?.enabled)
             return;
         const state = this.adapter.state;
         if (!state)
@@ -9423,7 +9435,7 @@ class KaleidoStAdapter {
         if (this.adapter.diceHistory.length > 50)
             this.adapter.diceHistory.length = 50;
         // §23.7 记忆联动：大成功/大失败 → 记忆候选（记忆开启时）
-        if (this.adapter.contract?.memory?.enabled && typeof result.degree === 'string') {
+        if (this.adapter.config.tier !== 'minimal' && this.adapter.contract?.memory?.enabled && typeof result.degree === 'string') {
             const degree = result.degree;
             if ((degree === 'critical' || degree === 'fumble') && this.memoryModule) {
                 this.memoryModule.writeMemoryCandidates(this.adapter.memoryStore, [this.memoryModule.makeAtom({ content: `[检定] ${text} → ${degree}`, type: 'episodic', importance: 0.7, confidence: 0.9, scope: 'chat', turnId })], Date.now());
@@ -10081,7 +10093,7 @@ class KaleidoStAdapter {
             context.registerFunctionTool('get_state', (async () => this.toolGetState()));
             context.registerFunctionTool('apply_patch', (async (args) => this.toolApplyPatch(args?.ops ?? [])));
             // §20.9 记忆工具（recall / memorize 语义；仅记忆开启时注册）
-            if (this.adapter.contract?.memory?.enabled) {
+            if (this.adapter.config.tier !== 'minimal' && this.adapter.contract?.memory?.enabled) {
                 context.registerFunctionTool('memory_search', (async (args) => this.toolMemorySearch(String(args?.query ?? ''))));
                 context.registerFunctionTool('memory_memorize', (async (args) => this.toolMemoryMemorize(args ?? {})));
             }
@@ -23598,7 +23610,12 @@ const ContractEditor = defineComponent({
         const dirty = ref(false);
         const feedback = ref('');
         const feedbackKind = ref('info');
-        const aiPrompt = ref('');
+        const aiAnswers = ref({
+            fields: ['', '', ''],
+            ces: ['', '', ''],
+            dice: ['', '', ''],
+            systems: ['', '', ''],
+        });
         const aiBusy = ref(false);
         const aiGenerated = ref(false);
         const lorebooks = ref([]);
@@ -23699,14 +23716,66 @@ const ContractEditor = defineComponent({
             selectedPath.value = Object.keys(draft.value.updateRules)[0] ?? '';
             changed();
         };
+        const helperPresets = {
+            fields: {
+                title: 'AI 帮帮 · 变量设计',
+                desc: '把角色卡要记录的状态拆成少而够用的变量，并明确什么时候必须更新或保持不变。',
+                quick: ['角色关系与好感', '背包、金钱和任务', '地点、时间与世界阶段'],
+                questions: [
+                    { label: '你想记录什么', help: '写玩法目标，不用写字段名。', placeholder: '例：记录主角与三名 NPC 的关系、当前任务和背包物品。' },
+                    { label: '参考什么来判断', help: '告诉 AI 应读取哪些剧情证据或世界书设定。', placeholder: '例：只参考角色明确说过的话、完成的行动和当前世界书；不要猜心理活动。' },
+                    { label: '必须遵守什么', help: '填写范围、初始值、禁止变化的情况或显示要求。', placeholder: '例：好感 0～100，普通寒暄不变化；任务完成后不可倒退。' },
+                ],
+            },
+            ces: {
+                title: 'AI 帮帮 · 世界书联动',
+                desc: '从当前角色真实世界书中选择具体条目，再用变量条件控制启用与关闭。',
+                quick: ['按关系阶段切换条目', '按地点启用区域设定', '按任务进度开放线索'],
+                questions: [
+                    { label: '何时触发', help: '说明变量、条件或剧情阶段。', placeholder: '例：关系阶段变为“恋人”，或好感达到 80。' },
+                    { label: '想联动哪个设定', help: '可写世界书和条目关键词，AI 只能从下方真实条目中匹配。', placeholder: '例：角色主世界书里的“恋人阶段”和“亲密称呼”。' },
+                    { label: '联动限制', help: '说明互斥、回退或不能编造的要求。', placeholder: '例：进入恋人阶段时关闭“陌生阶段”；找不到条目就不要创建规则。' },
+                ],
+            },
+            dice: {
+                title: 'AI 帮帮 · 检定规则',
+                desc: '只设计这张卡的检定方式、默认难度和玩家能看懂的成功失败结果。',
+                quick: ['COC 百分骰调查', 'D20 难度检定', '失败推进但增加代价'],
+                questions: [
+                    { label: '检定用在哪里', help: '写玩家会遇到的行动场景。', placeholder: '例：调查线索、潜行和说服 NPC 时使用。' },
+                    { label: '偏好的规则', help: '不确定可以写“请帮我选”。', placeholder: '例：COC 百分骰；属性越高越容易成功。' },
+                    { label: '成功与失败怎么处理', help: '尤其说明失败是否会卡死剧情。', placeholder: '例：失败仍给线索，但增加风险；大失败触发额外代价。' },
+                ],
+            },
+            systems: {
+                title: 'AI 帮帮 · 其他能力',
+                desc: '只判断是否需要长期记忆、世界推演或检定；没有明确用途就保持关闭。',
+                quick: ['只开长期记忆', '只开世界推演与风声', '给复杂长篇卡做保守组合'],
+                questions: [
+                    { label: '希望系统额外做什么', help: '写实际需求，不必先决定功能名。', placeholder: '例：记住长期约定，并让聊天外的势力每 5 轮推进一次。' },
+                    { label: '这张卡大概怎么玩', help: '说明短篇/长篇、人物数量和世界变化复杂度。', placeholder: '例：长篇群像，多个势力会在玩家看不到的地方行动。' },
+                    { label: '哪些能力不要开', help: '明确费用、RPM 或玩法限制。', placeholder: '例：不要检定；不要额外并发请求；优先低开销。' },
+                ],
+            },
+        };
         const generateDraft = async () => {
-            if (!aiPrompt.value.trim())
-                return tell('先写一句你想追踪什么。', 'error');
+            const helperSection = section.value === 'advanced' ? 'fields' : section.value;
+            if (helperSection === 'systems' && adapter.adapter.config.tier === 'minimal') {
+                tell('极简档只允许变量单次更新。请先到“运行设置”切换为普通档，再让 AI 设计记忆或世界推演。', 'info');
+                return;
+            }
+            const meta = helperPresets[helperSection];
+            const answers = aiAnswers.value[helperSection];
+            const description = meta.questions
+                .map((question, index) => answers[index]?.trim() ? `${question.label}：${answers[index].trim()}` : '')
+                .filter(Boolean)
+                .join('\n');
+            if (!description)
+                return tell(`先回答“${meta.questions[0].label}”，AI 才知道要设计什么。`, 'error');
             aiBusy.value = true;
             tell('正在让模型生成可校验草稿…');
             try {
-                const helperSection = section.value === 'advanced' ? 'fields' : section.value;
-                draft.value = await adapter.generateContractDraft(aiPrompt.value, helperSection);
+                draft.value = await adapter.generateContractDraft(description, helperSection, { baseContract: draft.value });
                 selectedPath.value = Object.keys(draft.value.updateRules)[0] ?? '';
                 dirty.value = true;
                 aiGenerated.value = true;
@@ -23750,6 +23819,10 @@ const ContractEditor = defineComponent({
         const toggleSystem = (name, enabled) => {
             if (!draft.value)
                 return;
+            if (enabled && (name === 'memory' || name === 'plot') && adapter.adapter.config.tier === 'minimal') {
+                tell('极简档只运行单次变量更新。请先到“运行设置”切换为普通档，再开启记忆或世界推演。', 'info');
+                return;
+            }
             if (name === 'memory')
                 draft.value.memory = { ...(draft.value.memory ?? { reflectionEveryN: 10, maxAtoms: 500 }), enabled };
             if (name === 'plot')
@@ -23829,41 +23902,13 @@ const ContractEditor = defineComponent({
             }
             return input('第一次使用时的值', field.type === 'number' ? Number(field.default ?? 0) : String(field.default ?? ''), (value) => patchField({ default: field.type === 'number' ? Number(value) || 0 : value }), field.type === 'number' ? { type: 'number' } : {}, field.type === 'number' ? '例如好感度从 0、生命值从 100 开始。只能输入有限数字。' : '新聊天还没有这个变量时，从这里开始。');
         };
-        const helperMeta = () => ({
-            fields: {
-                title: 'AI 帮帮 · 变量设计',
-                desc: '只设计变量、默认值和更新证据，不会擅自改世界书联动或开启额外系统。',
-                placeholder: '说明要记录什么、初始值是什么、什么剧情证据会让它变化、什么时候必须不变。例：设计角色好感度和关系阶段；只有明确帮助或伤害才变化，普通寒暄不变。',
-                quick: ['设计好感与关系阶段', '设计背包和金钱', '设计任务进度与失败条件'],
-            },
-            ces: {
-                title: 'AI 帮帮 · 世界书联动',
-                desc: '只使用当前角色真实存在的世界书条目，生成变量条件与条目启用规则。',
-                placeholder: '说明哪个变量达到什么条件时，应启用哪本世界书里的哪个条目。例：好感度达到 80 时启用“恋人阶段”，低于 60 时关闭。',
-                quick: ['按关系阶段联动条目', '按地点切换区域设定', '按任务状态启用线索'],
-            },
-            dice: {
-                title: 'AI 帮帮 · 检定规则',
-                desc: '只设计这张卡的检定系统、默认骰子和玩家可读结果说明。',
-                placeholder: '说明使用 COC、D20 还是自定义规则，成功条件和失败代价是什么。例：调查使用百分骰，失败不堵剧情但增加风险。',
-                quick: ['设计 COC 技能检定', '设计 D20 难度检定', '设计失败有代价的自定义检定'],
-            },
-            systems: {
-                title: 'AI 帮帮 · 可选功能',
-                desc: '根据用途只开启确实需要的记忆、世界推演或检定，并使用低开销默认值。',
-                placeholder: '说明希望系统额外处理什么，以及哪些功能不要开启。例：记住长期约定，每 5 轮推进幕后事件，不需要检定。',
-                quick: ['启用长期记忆', '启用世界推演和风声', '给复杂卡配置保守功能组合'],
-            },
-            advanced: {
-                title: 'AI 帮帮', desc: '', placeholder: '', quick: [],
-            },
-        }[section.value]);
         return () => {
             const contract = draft.value;
             if (!contract)
                 return h('div', { class: 'nlk-empty' }, '契约尚未加载。');
             const field = contract.updateRules[selectedPath.value];
-            const aiMeta = helperMeta();
+            const helperSection = section.value === 'advanced' ? 'fields' : section.value;
+            const aiMeta = helperPresets[helperSection];
             const nav = (key, label, count) => h('button', {
                 class: section.value === key ? 'nlk-subnav nlk-subnav-active' : 'nlk-subnav', onClick: () => { section.value = key; },
             }, `${label}${count === undefined ? '' : ` ${count}`}`);
@@ -23957,13 +24002,16 @@ const ContractEditor = defineComponent({
                 ]);
             }
             else if (section.value === 'systems') {
-                const systemCard = (name, desc, enabled, toggle) => h('article', { class: enabled ? 'nlk-system-card nlk-system-on' : 'nlk-system-card' }, [
-                    h('div', null, [h('strong', null, name), h('p', null, desc)]), h('label', { class: 'nlk-switch' }, [h('input', { type: 'checkbox', checked: enabled, onChange: (e) => toggle(e.target.checked) }), h('span')]),
+                const optionalAvailable = adapter.adapter.config.tier !== 'minimal';
+                const systemCard = (name, desc, enabled, toggle, locked = false) => h('article', { class: enabled && !locked ? 'nlk-system-card nlk-system-on' : locked ? 'nlk-system-card nlk-system-locked' : 'nlk-system-card' }, [
+                    h('div', null, [h('strong', null, name), h('p', null, desc), locked ? h('small', { class: 'nlk-system-lock-note' }, enabled ? '契约已配置，但极简档会暂停运行；切到普通档即可恢复。' : '普通档或进阶档可开启。') : null]), h('label', { class: 'nlk-switch' }, [h('input', { type: 'checkbox', checked: enabled, disabled: locked, onChange: (e) => toggle(e.target.checked) }), h('span')]),
                 ]);
                 content = h('div', { class: 'nlk-stack' }, [
-                    h('div', { class: 'nlk-callout' }, '勾选需要的功能后，点击页面右上角“检查并保存”才会生效。关闭的功能不会加载对应数据和计算。'),
-                    systemCard('长期记忆', '让系统记住跨越很多轮的重要事实，并在相关时自动找回来。', contract.memory?.enabled === true, (on) => toggleSystem('memory', on)),
-                    systemCard('世界推演', '让聊天外的事件继续发展，并把玩家可能听到的消息带回剧情。', contract.plot?.enabled === true, (on) => toggleSystem('plot', on)),
+                    optionalAvailable
+                        ? h('div', { class: 'nlk-callout' }, '勾选需要的功能后，点击页面右上角“检查并保存”才会生效。关闭的功能不会加载对应数据和计算。')
+                        : h('div', { class: 'nlk-callout nlk-callout-warn nlk-tier-lock-callout' }, [h('span', null, '当前是极简档：只进行传统单次变量更新，记忆和世界推演不会加载、写入或额外请求。'), h('button', { class: 'nlk-btn', onClick: () => { store.activeTab = 'config'; } }, '切换到普通档')]),
+                    systemCard('长期记忆', '单次模式也能写入：到反思轮时，记忆候选与变量更新由同一个请求返回，不会额外占用 RPM。', contract.memory?.enabled === true, (on) => toggleSystem('memory', on), !optionalAvailable),
+                    systemCard('世界推演', '让聊天外的事件继续发展，并把玩家可能听到的消息带回剧情；按作者设定的轮次节流。', contract.plot?.enabled === true, (on) => toggleSystem('plot', on), !optionalAvailable),
                     h('article', { class: 'nlk-card' }, [h('div', { class: 'nlk-pane-title' }, '变量 AI 预算'), h('div', { class: 'nlk-callout' }, '每轮调用 1 次还是进入多步工具循环，由玩家在“运行设置”控制；作者这里只限制每一步能使用的输出预算。'), h('div', { class: 'nlk-form-grid' }, [
                             input('每一步最多输出多少 token', contract.guardrails.maxTokensPerStep, (value) => { contract.guardrails.maxTokensPerStep = Math.max(128, Number(value) || 2048); changed(); }, { type: 'number', min: 128, max: 8192 }, '普通卡保持 2048 即可。它限制单次输出长度，不会增加请求次数。'),
                         ])]),
@@ -23982,8 +24030,12 @@ const ContractEditor = defineComponent({
                 ]),
                 section.value !== 'advanced' ? h('section', { class: 'nlk-ai-helper' }, [
                     h('div', { class: 'nlk-ai-helper-head' }, [h('div', { class: 'nlk-ai-orb' }, '✦'), h('div', null, [h('strong', null, aiMeta.title), h('small', null, aiMeta.desc)])]),
-                    h('div', { class: 'nlk-ai-quick' }, aiMeta.quick.map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiPrompt.value = text; } }, text))),
-                    h('textarea', { class: 'nlk-input nlk-ai-prompt', rows: 3, value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: aiMeta.placeholder }),
+                    h('div', { class: 'nlk-ai-quick' }, aiMeta.quick.map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiAnswers.value[helperSection][0] = text; } }, text))),
+                    h('div', { class: 'nlk-ai-question-grid' }, aiMeta.questions.map((question, index) => h('label', { class: index === 0 ? 'nlk-ai-question nlk-ai-question-main' : 'nlk-ai-question' }, [
+                        h('span', null, [h('b', null, `${index + 1}`), h('strong', null, question.label)]),
+                        h('small', null, question.help),
+                        h('textarea', { class: 'nlk-input', rows: index === 0 ? 3 : 2, value: aiAnswers.value[helperSection][index] ?? '', onInput: (e) => { aiAnswers.value[helperSection][index] = e.target.value; }, placeholder: question.placeholder }),
+                    ]))),
                     h('div', { class: 'nlk-ai-helper-foot' }, [h('span', null, loreLoading.value ? '正在读取当前角色世界书…' : `上下文：当前契约 + ${lorebooks.value.length} 本世界书、${lorebooks.value.reduce((sum, book) => sum + book.entries.length, 0)} 个真实条目`), h('button', { class: 'nlk-btn nlk-btn-primary', disabled: aiBusy.value, onClick: generateDraft }, aiBusy.value ? '正在设计…' : '生成并载入表单')]),
                     aiGenerated.value ? h('div', { class: 'nlk-ai-result' }, [
                         h('div', null, [h('strong', null, 'AI 方案已载入可视化表单'), h('small', null, `${Object.keys(contract.updateRules).length} 个变量 · ${(contract.ejs ?? []).length} 条世界书联动 · ${[contract.memory?.enabled ? '记忆' : '', contract.plot?.enabled ? '世界推演' : '', contract.dice?.enabled ? '检定' : ''].filter(Boolean).join('、') || '未开启额外系统'}`)]),
@@ -24069,12 +24121,18 @@ const MemoryView = defineComponent({
         const adapter = useAdapter();
         const query = ref('');
         const searchResult = ref('');
+        const memoryView = ref('atoms');
+        const typeFilter = ref('all');
+        const statusFilter = ref('all');
+        const scopeFilter = ref('all');
+        const confirmDelete = ref('');
         const atoms = () => {
             void store.memoryVersion; // 事件驱动重渲染
             return adapter.adapter.memoryStore.atoms;
         };
         const tables = () => adapter.adapter.memoryTables;
-        const enabled = () => adapter.adapter.contract?.memory?.enabled === true;
+        const configured = () => adapter.adapter.contract?.memory?.enabled === true;
+        const available = () => adapter.adapter.config.tier !== 'minimal';
         const decayOf = (atom) => {
             const daysSince = Math.max(0, (Date.now() - atom.lastAccessedAt) / 86400000);
             return memoryDecayScore(atom.decay, atom.ttlDays, daysSince);
@@ -24085,56 +24143,89 @@ const MemoryView = defineComponent({
         };
         const forget = (id) => { dispatch({ action: 'memoryForget', atomId: id }); };
         const revive = (id) => { dispatch({ action: 'memoryRevive', atomId: id }); };
-        const remove = (id) => { dispatch({ action: 'memoryDelete', atomId: id }); };
+        const remove = (id) => {
+            if (confirmDelete.value !== id) {
+                confirmDelete.value = id;
+                return;
+            }
+            dispatch({ action: 'memoryDelete', atomId: id });
+            confirmDelete.value = '';
+        };
         const archiveNow = () => { dispatch({ action: 'memoryArchiveNow' }); };
         const TYPE_NAMES = { episodic: '情景', factual: '事实', relational: '关系', preference: '偏好', planned: '计划', unknown: '未知' };
         const STATUS_NAMES = { active: '活跃', dormant: '休眠', superseded: '被替代', expired: '过期', forgotten: '遗忘' };
         return () => {
-            if (!enabled()) {
+            if (!available()) {
+                return h('div', { class: 'nlk-section' }, [
+                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '◇'), h('h2', null, '极简档不运行长期记忆'), h('p', null, configured() ? '这张卡已经配置了记忆，但极简档会完整暂停读取、写入和维护。切换到普通档后原有配置与数据会继续使用。' : '极简档只做一次变量更新，不加载记忆库。需要长篇记忆时再切到普通档。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.activeTab = 'config'; } }, '去切换普通档')]),
+                ]);
+            }
+            if (!configured()) {
                 return h('div', { class: 'nlk-section' }, [
                     h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '◉'), h('h2', null, '长期记忆目前是关闭的'), h('p', null, '开启后，系统会保存跨越多轮的重要事实，并在剧情相关时自动找回来。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'systems'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去作者页开启')]),
                 ]);
             }
-            const list = atoms().slice().sort((a, b) => b.lastAccessedAt - a.lastAccessedAt).slice(0, 60);
+            const allAtoms = atoms();
+            const activeCount = allAtoms.filter((atom) => atom.status === 'active').length;
+            const visible = allAtoms
+                .filter((atom) => typeFilter.value === 'all' || atom.type === typeFilter.value)
+                .filter((atom) => statusFilter.value === 'all' || atom.status === statusFilter.value)
+                .filter((atom) => scopeFilter.value === 'all' || atom.scope === scopeFilter.value)
+                .filter((atom) => !query.value.trim() || `${atom.content} ${atom.entities.join(' ')}`.toLowerCase().includes(query.value.trim().toLowerCase()))
+                .sort((a, b) => b.lastAccessedAt - a.lastAccessedAt)
+                .slice(0, 100);
+            const scopeGroups = [
+                { key: 'chat', name: '当前聊天', desc: '只属于这次聊天的剧情记忆' },
+                { key: 'run', name: '当前周目', desc: '同一周目继续保留的记忆' },
+                { key: 'global', name: '跨聊天', desc: '跨聊天与角色卡共享的长期事实' },
+            ];
             return h('div', { class: 'nlk-section' }, [
-                h('div', { class: 'nlk-h3' }, `长期记忆（${atoms().length} 原子 / ${tables().length} 表）`),
-                h('div', { class: 'nlk-row' }, [
-                    h('input', {
-                        class: 'nlk-contract-input',
-                        style: 'flex:1; min-width: 160px;',
-                        value: query.value,
-                        onInput: (event) => { query.value = event.target.value; },
-                        placeholder: '检索记忆（BM25）…',
-                    }),
-                    h('button', { class: 'nlk-btn', onClick: search }, '搜索'),
-                    h('button', { class: 'nlk-btn', onClick: archiveNow }, '手动归档'),
+                h('section', { class: 'nlk-page-head nlk-memory-head' }, [h('div', null, [h('div', { class: 'nlk-eyebrow' }, '记忆库'), h('h2', null, '这张卡记住了什么'), h('p', null, '按作用域整理、搜索和维护记忆。单次模式会把反思候选合并进变量请求，不会额外调用模型。')]), h('button', { class: 'nlk-btn', onClick: archiveNow }, '从修改记录归档')]),
+                h('div', { class: 'nlk-memory-stats' }, [
+                    h('div', { class: 'nlk-memory-stat' }, [h('strong', null, String(allAtoms.length)), h('span', null, '全部记忆')]),
+                    h('div', { class: 'nlk-memory-stat' }, [h('strong', null, String(activeCount)), h('span', null, '正在使用')]),
+                    h('div', { class: 'nlk-memory-stat' }, [h('strong', null, String(allAtoms.length - activeCount)), h('span', null, '休眠 / 遗忘')]),
+                    h('div', { class: 'nlk-memory-stat' }, [h('strong', null, String(tables().length)), h('span', null, '结构化表')]),
                 ]),
+                h('div', { class: 'nlk-memory-tabs' }, [
+                    h('button', { class: memoryView.value === 'atoms' ? 'nlk-memory-tab nlk-memory-tab-active' : 'nlk-memory-tab', onClick: () => { memoryView.value = 'atoms'; } }, `记忆条目 ${allAtoms.length}`),
+                    h('button', { class: memoryView.value === 'tables' ? 'nlk-memory-tab nlk-memory-tab-active' : 'nlk-memory-tab', onClick: () => { memoryView.value = 'tables'; } }, `结构化表 ${tables().length}`),
+                ]),
+                memoryView.value === 'atoms' ? h('div', { class: 'nlk-memory-toolbar' }, [
+                    h('input', { class: 'nlk-input nlk-memory-search', type: 'search', value: query.value, onInput: (event) => { query.value = event.target.value; }, placeholder: '搜索内容或人物…' }),
+                    h('select', { class: 'nlk-input', value: typeFilter.value, onChange: (e) => { typeFilter.value = e.target.value; } }, [['all', '全部类型'], ...Object.entries(TYPE_NAMES)].map(([value, label]) => h('option', { value }, label))),
+                    h('select', { class: 'nlk-input', value: statusFilter.value, onChange: (e) => { statusFilter.value = e.target.value; } }, [['all', '全部状态'], ...Object.entries(STATUS_NAMES)].map(([value, label]) => h('option', { value }, label))),
+                    h('select', { class: 'nlk-input', value: scopeFilter.value, onChange: (e) => { scopeFilter.value = e.target.value; } }, [['all', '全部范围'], ['chat', '当前聊天'], ['run', '当前周目'], ['global', '跨聊天']].map(([value, label]) => h('option', { value }, label))),
+                    h('button', { class: 'nlk-btn', disabled: !query.value.trim(), onClick: search }, '语义检索'),
+                ]) : null,
                 searchResult.value
-                    ? h('pre', { class: 'nlk-pre' }, searchResult.value)
+                    ? h('div', { class: 'nlk-memory-search-result' }, [h('strong', null, '语义检索结果'), h('pre', { class: 'nlk-pre' }, searchResult.value), h('button', { class: 'nlk-icon-btn', onClick: () => { searchResult.value = ''; } }, '×')])
                     : null,
-                h('div', { class: 'nlk-log' }, list.map((atom) => {
-                    const decay = decayOf(atom);
-                    const pct = Math.round(atom.importance * 100);
-                    const decayPct = Math.round(decay * 100);
-                    return h('div', { class: 'nlk-log-row', key: atom.id }, [
-                        h('span', null, `[${TYPE_NAMES[atom.type] ?? atom.type}]`),
-                        h('span', { style: 'flex:1;' }, atom.content),
-                        h('span', { class: 'nlk-diff' }, `重要 ${pct}%`),
-                        h('span', { class: decay < 0.3 ? 'nlk-warn' : 'nlk-diff' }, `衰减 ${decayPct}%`),
-                        h('span', null, `强化×${atom.reinforcementCount}`),
-                        h('span', null, `[${STATUS_NAMES[atom.status] ?? atom.status}]`),
-                        atom.status !== 'active'
-                            ? h('button', { class: 'nlk-btn nlk-btn-sm', onClick: () => revive(atom.id) }, '复活')
-                            : h('button', { class: 'nlk-btn nlk-btn-sm', onClick: () => forget(atom.id) }, '遗忘'),
-                        h('button', { class: 'nlk-btn nlk-btn-sm', onClick: () => remove(atom.id) }, '删除'),
+                memoryView.value === 'atoms' ? h('div', { class: 'nlk-memory-groups' }, scopeGroups.map((group) => {
+                    const rows = visible.filter((atom) => atom.scope === group.key);
+                    if (!rows.length)
+                        return null;
+                    return h('section', { class: 'nlk-memory-group', key: group.key }, [
+                        h('div', { class: 'nlk-memory-group-head' }, [h('div', null, [h('strong', null, group.name), h('small', null, group.desc)]), h('span', null, `${rows.length} 条`)]),
+                        h('div', { class: 'nlk-memory-list' }, rows.map((atom) => {
+                            const decay = decayOf(atom);
+                            const pct = Math.round(atom.importance * 100);
+                            const decayPct = Math.round(decay * 100);
+                            return h('article', { class: atom.status === 'active' ? 'nlk-memory-item' : 'nlk-memory-item nlk-memory-item-muted', key: atom.id }, [
+                                h('div', { class: 'nlk-memory-type-icon' }, atom.type === 'relational' ? '↔' : atom.type === 'planned' ? '✓' : atom.type === 'preference' ? '♥' : atom.type === 'episodic' ? '◷' : 'i'),
+                                h('div', { class: 'nlk-memory-content' }, [h('div', null, [h('span', { class: 'nlk-type-badge' }, TYPE_NAMES[atom.type] ?? atom.type), h('span', { class: `nlk-memory-status nlk-memory-status-${atom.status}` }, STATUS_NAMES[atom.status] ?? atom.status)]), h('strong', null, atom.content), atom.entities.length ? h('small', null, `涉及：${atom.entities.join('、')}`) : null]),
+                                h('div', { class: 'nlk-memory-health' }, [h('small', null, `重要 ${pct}% · 保留度 ${decayPct}% · 强化 ${atom.reinforcementCount} 次`), h('div', { class: 'nlk-memory-meter' }, h('span', { style: `width:${Math.max(4, decayPct)}%` }))]),
+                                h('div', { class: 'nlk-memory-actions' }, [atom.status !== 'active' ? h('button', { class: 'nlk-btn nlk-btn-sm', onClick: () => revive(atom.id) }, '恢复') : h('button', { class: 'nlk-btn nlk-btn-sm', onClick: () => forget(atom.id) }, '暂不使用'), h('button', { class: confirmDelete.value === atom.id ? 'nlk-btn nlk-btn-sm nlk-danger' : 'nlk-btn nlk-btn-sm', onClick: () => remove(atom.id) }, confirmDelete.value === atom.id ? '确认删除' : '删除')]),
+                            ]);
+                        })),
                     ]);
-                })),
-                tables().length
-                    ? h('div', { class: 'nlk-h3' }, `记忆表（${tables().length}）`)
-                    : null,
-                tables().map((table) => h('div', { key: table.id }, [
-                    h('div', null, `${table.name}（${table.columns.join(' / ')}${table.floorScoped ? '，按楼层隔离' : ''}，${table.rows.length} 行）`),
-                ])),
+                }).filter(Boolean)) : h('div', { class: 'nlk-memory-table-grid' }, tables().length ? tables().map((table) => h('article', { class: 'nlk-memory-table-card', key: table.id }, [
+                    h('div', { class: 'nlk-memory-table-head' }, [h('div', { class: 'nlk-memory-type-icon' }, '▦'), h('div', null, [h('strong', null, table.name), h('small', null, table.floorScoped ? '按剧情楼层隔离' : '跨楼层持续保存')]), h('span', null, `${table.rows.length} 行`)]),
+                    h('div', { class: 'nlk-memory-columns' }, table.columns.map((column) => h('span', null, column))),
+                    table.rows.slice(0, 5).map((row) => h('div', { class: 'nlk-memory-table-row' }, table.columns.map((column) => h('span', null, row.values[column.replace(/^[#*]/, '')] ?? '—')))),
+                    table.rows.length > 5 ? h('small', { class: 'nlk-hint' }, `还有 ${table.rows.length - 5} 行未展开`) : null,
+                ])) : h('div', { class: 'nlk-memory-empty-list' }, '这张卡还没有定义结构化记忆表。')),
+                memoryView.value === 'atoms' && !visible.length ? h('div', { class: 'nlk-memory-empty-list' }, allAtoms.length ? '没有符合筛选条件的记忆。' : '记忆库还是空的。继续聊天后，重要事实会在反思轮自动写入。') : null,
             ]);
         };
     },
@@ -24150,7 +24241,8 @@ const PlotView = defineComponent({
             return adapter.adapter.plotEvents;
         };
         const winds = () => adapter.adapter.plotWinds;
-        const enabled = () => adapter.adapter.contract?.plot?.enabled === true;
+        const configured = () => adapter.adapter.contract?.plot?.enabled === true;
+        const available = () => adapter.adapter.config.tier !== 'minimal';
         const regional = () => adapter.adapter.regionalIncident;
         const advance = (id) => { dispatch({ action: 'plotAdvance', eventId: id }); };
         const stall = (id) => { dispatch({ action: 'plotStall', eventId: id }); };
@@ -24158,7 +24250,12 @@ const PlotView = defineComponent({
         const TYPE_NAMES = { conflict: '冲突', progress: '推进' };
         const WIND_NAMES = { announcement: '公告', report: '报道', rumor: '流言', sentiment: '舆情' };
         return () => {
-            if (!enabled()) {
+            if (!available()) {
+                return h('div', { class: 'nlk-section' }, [
+                    h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '◇'), h('h2', null, '极简档不运行世界推演'), h('p', null, configured() ? '这张卡已经配置了世界推演，但极简档会暂停事件推进、风声和额外请求。切换到普通档即可恢复。' : '极简档只做一次变量更新；普通档才可开启聊天外的事件推进与风声。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.activeTab = 'config'; } }, '去切换普通档')]),
+                ]);
+            }
+            if (!configured()) {
                 return h('div', { class: 'nlk-section' }, [
                     h('div', { class: 'nlk-feature-empty' }, [h('div', { class: 'nlk-empty-icon' }, '⌁'), h('h2', null, '世界推演目前是关闭的'), h('p', null, '开启后，聊天之外的事件也会继续发展，并把玩家可能听到的消息带回故事。'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: () => { store.authorSection = 'systems'; store.roleMode = 'author'; store.activeTab = 'author'; } }, '去作者页开启')]),
                 ]);
@@ -24298,7 +24395,11 @@ const MigrationView = defineComponent({
         const draftText = ref('');
         const busy = ref(false);
         const aiBusy = ref(false);
-        const aiPrompt = ref('补全每个变量可观察的更新证据、边界和不变化条件；保留所有需人工确认项。');
+        const migrationAnswers = ref([
+            '保留解析出的全部变量，补全每个变量可观察的更新证据、边界和不变化条件。',
+            '按原卡含义整理变量分组与玩家显示，不改变已有初始值。',
+            '无法从原文确认的规则继续标记“需人工确认”，不要猜测或删除。',
+        ]);
         const confirmImport = ref(false);
         const readUpload = async (event, target) => {
             const file = event.target.files?.[0];
@@ -24379,7 +24480,12 @@ const MigrationView = defineComponent({
                     '【世界书 / MVU 规则原文】', worldbookText.value.slice(0, 12000),
                     '【ZOD 脚本原文】', scriptsText.value.slice(0, 12000),
                 ].join('\n');
-                const improved = await adapter.generateContractDraft(aiPrompt.value.trim() || '审校迁移初稿，补全可观察规则并保留需人工确认项。', 'migration', { baseContract, sourceMaterial });
+                const migrationPrompt = [
+                    `【重点保留与补全】\n${migrationAnswers.value[0]?.trim() || '保留全部确定性迁移结果。'}`,
+                    `【变量怎样整理】\n${migrationAnswers.value[1]?.trim() || '沿用原卡结构与初始值。'}`,
+                    `【不确定内容怎样处理】\n${migrationAnswers.value[2]?.trim() || '标记需人工确认，禁止猜测。'}`,
+                ].join('\n\n');
+                const improved = await adapter.generateContractDraft(migrationPrompt, 'migration', { baseContract, sourceMaterial });
                 draftText.value = JSON.stringify(improved, null, 2);
                 reportText.value += `\n\n✅ AI 已按迁移专用规则审校初稿：保留确定性结果，补全规则，并继续标记不确定项。尚未导入。`;
                 confirmImport.value = false;
@@ -24405,8 +24511,14 @@ const MigrationView = defineComponent({
             ]),
             h('section', { class: 'nlk-ai-helper nlk-migration-ai' }, [
                 h('div', { class: 'nlk-ai-helper-head' }, [h('div', { class: 'nlk-ai-orb' }, 'AI'), h('div', null, [h('strong', null, 'AI 帮帮 · ZOD 迁移审校'), h('small', null, '先由本地解析器完整提取，再让 AI 补全语义；AI 无权删除变量、执行旧脚本或静默猜测。')])]),
-                h('div', { class: 'nlk-ai-quick' }, ['补全更新证据和边界', '梳理变量分组与玩家显示', '保留并解释需人工确认规则'].map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiPrompt.value = text; } }, text))),
-                h('textarea', { class: 'nlk-input nlk-ai-prompt', rows: 3, value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: '告诉 AI 重点审校什么，例如：保留所有变量，把好感相关规则改成可从剧情观察的证据，不确定的旧命令继续标记需人工确认。' }),
+                h('div', { class: 'nlk-ai-question-grid' }, [
+                    ['重点保留与补全什么', '例：保留全部变量，把好感规则补成可从剧情观察的证据。'],
+                    ['变量怎样整理给作者和玩家看', '例：按角色、任务、世界分组；隐藏内部计数器。'],
+                    ['不确定的旧规则怎样处理', '例：全部保留并标记需人工确认，禁止自行猜测。'],
+                ].map(([label, placeholder], index) => h('label', { class: index === 0 ? 'nlk-ai-question nlk-ai-question-main' : 'nlk-ai-question' }, [
+                    h('span', { class: 'nlk-label' }, label),
+                    h('textarea', { class: 'nlk-input', rows: index === 0 ? 3 : 2, value: migrationAnswers.value[index], placeholder, onInput: (event) => { migrationAnswers.value[index] = event.target.value; } }),
+                ]))),
                 h('div', { class: 'nlk-ai-helper-foot' }, [h('span', null, draftText.value ? '确定性迁移初稿已就绪，AI 结果仍需手动确认导入' : '先点击“检测并生成迁移报告”'), h('button', { class: 'nlk-btn nlk-btn-primary', disabled: aiBusy.value || !draftText.value, onClick: () => { void improveWithAi(); } }, aiBusy.value ? '正在审校…' : '用 AI 审校初稿')]),
             ]),
             reportText.value ? h('pre', { class: 'nlk-pre' }, reportText.value) : null,
@@ -24426,6 +24538,8 @@ const ConfigView = defineComponent({
         const embeddingTest = ref('');
         const primaryModels = ref([]);
         const embeddingModels = ref([]);
+        const primaryManual = ref(false);
+        const embeddingManual = ref(false);
         const modelLoading = ref(null);
         const saving = ref(false);
         const confirmReset = ref(false);
@@ -24495,17 +24609,21 @@ const ConfigView = defineComponent({
             actionMessage.value = '正在通过酒馆后端读取 /models…';
             try {
                 const models = await adapter.listOpenAiModels({ baseUrl: connection.baseUrl, apiKey: connection.apiKey });
+                if (!models.length)
+                    throw new Error('接口连接成功，但 /models 没有返回可用模型。可检查 URL，或展开手动填写。');
                 if (kind === 'primary') {
                     primaryModels.value = models;
-                    if (!draft.value.primaryAi.model && models[0])
+                    primaryManual.value = false;
+                    if (!models.includes(draft.value.primaryAi.model))
                         draft.value.primaryAi.model = models[0];
                 }
                 else {
-                    embeddingModels.value = models;
-                    if (!draft.value.embeddingApi.model && models[0])
-                        draft.value.embeddingApi.model = models[0];
+                    embeddingModels.value = [...models].sort((a, b) => Number(/embed/i.test(b)) - Number(/embed/i.test(a)) || a.localeCompare(b));
+                    embeddingManual.value = false;
+                    if (!models.includes(draft.value.embeddingApi.model))
+                        draft.value.embeddingApi.model = embeddingModels.value[0];
                 }
-                actionMessage.value = `已拉取 ${models.length} 个模型，可搜索或手动填写。`;
+                actionMessage.value = `连接成功，已读取 ${models.length} 个模型并放入选择列表。`;
             }
             catch (error) {
                 actionMessage.value = error instanceof Error ? error.message : String(error);
@@ -24515,6 +24633,8 @@ const ConfigView = defineComponent({
             }
         };
         const saveConnections = async () => {
+            if (draft.value.tier === 'minimal')
+                draft.value.agent.maxRequestsPerTurn = 1;
             const invalid = validateConnections();
             if (invalid) {
                 actionMessage.value = invalid;
@@ -24568,7 +24688,7 @@ const ConfigView = defineComponent({
             actionMessage.value = result.ok ? '已恢复出厂配置，可用快照回滚。' : result.error ?? '恢复失败';
             confirmReset.value = false;
         };
-        const TIER_LABEL = { minimal: '极简', standard: '标准', advanced: '进阶' };
+        const TIER_LABEL = { minimal: '极简', standard: '普通', advanced: '进阶' };
         return () => {
             const current = config();
             const last = report();
@@ -24580,7 +24700,7 @@ const ConfigView = defineComponent({
                     h('div', { class: 'nlk-setup-line' }),
                     h('div', { class: 'nlk-setup-step' }, [h('b', null, '2'), h('span', null, [h('strong', null, '向量模型'), h('small', null, draft.value.embeddingApi.enabled ? draft.value.embeddingApi.model || '待配置' : '可选，当前关闭')])]),
                     h('div', { class: 'nlk-setup-line' }),
-                    h('div', { class: 'nlk-setup-step' }, [h('b', null, '3'), h('span', null, [h('strong', null, '请求模式'), h('small', null, draft.value.agent.maxRequestsPerTurn === 1 ? '单次更新' : `串行 ${draft.value.agent.maxRequestsPerTurn} 次`)])]),
+                    h('div', { class: 'nlk-setup-step' }, [h('b', null, '3'), h('span', null, [h('strong', null, '请求模式'), h('small', null, draft.value.tier === 'minimal' ? '极简档锁定单次' : draft.value.agent.maxRequestsPerTurn === 1 ? '单次更新' : `串行 ${draft.value.agent.maxRequestsPerTurn} 次`)])]),
                 ]),
                 h('section', { class: 'nlk-model-card' }, [
                     h('div', { class: 'nlk-model-card-head' }, [h('div', { class: 'nlk-info-icon' }, 'AI'), h('div', null, [h('strong', null, '主 AI · 必填'), h('p', null, '只配置这一套，就会供变量更新、世界风声、记忆整理和 AI 帮帮共同使用。')])]),
@@ -24592,8 +24712,16 @@ const ConfigView = defineComponent({
                         ? h('div', { class: 'nlk-callout' }, '无需重复填写 Key。万花筒会调用酒馆当前已连接的聊天模型；请先在酒馆 API 连接页确认模型可正常回复。')
                         : h('div', { class: 'nlk-model-form' }, [
                             h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, 'API URL'), h('input', { class: 'nlk-input', value: draft.value.primaryAi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.primaryAi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '填写到 /v1 或完整 /chat/completions 都可以。拉模型和实际生成都会经酒馆后端代理，不受浏览器跨域限制。')]),
-                            h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '模型'), h('div', { class: 'nlk-model-picker' }, [h('input', { class: 'nlk-input', list: 'nlk-primary-models', value: draft.value.primaryAi.model, placeholder: '拉取或手动填写模型名', onInput: (e) => { draft.value.primaryAi.model = e.target.value; } }), h('button', { type: 'button', class: 'nlk-btn', disabled: modelLoading.value !== null, onClick: () => { void pullModels('primary'); } }, modelLoading.value === 'primary' ? '拉取中…' : '拉取模型'), h('datalist', { id: 'nlk-primary-models' }, primaryModels.value.map((model) => h('option', { value: model })))]), h('small', { class: 'nlk-help' }, primaryModels.value.length ? `已读取 ${primaryModels.value.length} 个模型，可输入关键词筛选。` : '接口不支持 /models 时仍可手动填写。')]),
                             h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'API Key'), h('input', { class: 'nlk-input', type: 'password', autocomplete: 'off', value: draft.value.primaryAi.apiKey, placeholder: '本地无鉴权接口可留空', onInput: (e) => { draft.value.primaryAi.apiKey = e.target.value; } })]),
+                            h('section', { class: 'nlk-model-select-step nlk-form-span' }, [
+                                h('div', { class: 'nlk-model-select-head' }, [h('div', null, [h('strong', null, '选择模型'), h('small', null, '填写 URL 和 Key 后，让万花筒直接读取接口里的模型。')]), h('button', { type: 'button', class: 'nlk-btn nlk-btn-primary', disabled: modelLoading.value !== null, onClick: () => { void pullModels('primary'); } }, modelLoading.value === 'primary' ? '正在连接…' : primaryModels.value.length ? '重新读取模型' : '连接并读取模型')]),
+                                primaryModels.value.length && !primaryManual.value
+                                    ? h('select', { class: 'nlk-input nlk-model-select', value: draft.value.primaryAi.model, onChange: (e) => { draft.value.primaryAi.model = e.target.value; } }, primaryModels.value.map((model) => h('option', { value: model }, model)))
+                                    : primaryManual.value
+                                        ? h('input', { class: 'nlk-input', value: draft.value.primaryAi.model, placeholder: '仅在接口不提供 /models 时手动填写', onInput: (e) => { draft.value.primaryAi.model = e.target.value; } })
+                                        : h('div', { class: 'nlk-model-empty' }, draft.value.primaryAi.model ? `当前保存：${draft.value.primaryAi.model}。点击右上按钮刷新可选模型。` : '尚未读取模型，点击“连接并读取模型”后直接从列表选择。'),
+                                h('button', { type: 'button', class: 'nlk-text-button', onClick: () => { primaryManual.value = !primaryManual.value; } }, primaryManual.value ? '返回模型列表' : '接口没有模型列表？改为手动填写'),
+                            ]),
                         ]),
                     h('div', { class: 'nlk-row' }, [h('button', { class: 'nlk-btn nlk-btn-primary', disabled: saving.value, onClick: () => { void saveConnections(); } }, saving.value ? '保存中…' : '保存设置'), h('button', { class: 'nlk-btn', disabled: saving.value, onClick: () => { void testPrimary(); } }, '测试主 AI')]),
                     primaryTest.value ? h('div', { class: 'nlk-test-result' }, primaryTest.value) : null,
@@ -24602,8 +24730,16 @@ const ConfigView = defineComponent({
                     h('div', { class: 'nlk-model-card-head' }, [h('div', { class: 'nlk-info-icon' }, 'V'), h('div', null, [h('strong', null, '向量模型 · 可选'), h('p', null, '只用于更精细的长期记忆检索。关闭时自动使用关键词检索，不会影响变量和世界书。')]), h('label', { class: 'nlk-switch-line' }, [h('input', { type: 'checkbox', checked: draft.value.embeddingApi.enabled, onChange: (e) => { draft.value.embeddingApi.enabled = e.target.checked; } }), draft.value.embeddingApi.enabled ? '已启用' : '未启用'])]),
                     draft.value.embeddingApi.enabled ? h('div', { class: 'nlk-model-form' }, [
                         h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, '向量 API URL'), h('input', { class: 'nlk-input', value: draft.value.embeddingApi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.embeddingApi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '系统会自动请求 /embeddings；模型列表从同一地址的 /models 读取。')]),
-                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量模型'), h('div', { class: 'nlk-model-picker' }, [h('input', { class: 'nlk-input', list: 'nlk-embedding-models', value: draft.value.embeddingApi.model, placeholder: '拉取或手动填写模型名', onInput: (e) => { draft.value.embeddingApi.model = e.target.value; } }), h('button', { type: 'button', class: 'nlk-btn', disabled: modelLoading.value !== null, onClick: () => { void pullModels('embedding'); } }, modelLoading.value === 'embedding' ? '拉取中…' : '拉取模型'), h('datalist', { id: 'nlk-embedding-models' }, embeddingModels.value.map((model) => h('option', { value: model })))]), h('small', { class: 'nlk-help' }, embeddingModels.value.length ? `已读取 ${embeddingModels.value.length} 个模型。` : '某些服务不会标记模型类型，请选择明确的 embedding 模型。')]),
                         h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'API Key'), h('input', { class: 'nlk-input', type: 'password', autocomplete: 'off', value: draft.value.embeddingApi.apiKey, placeholder: '本地无鉴权接口可留空', onInput: (e) => { draft.value.embeddingApi.apiKey = e.target.value; } })]),
+                        h('section', { class: 'nlk-model-select-step nlk-form-span' }, [
+                            h('div', { class: 'nlk-model-select-head' }, [h('div', null, [h('strong', null, '选择向量模型'), h('small', null, '模型很多时请选择名称中含 embedding / embed 的项目。')]), h('button', { type: 'button', class: 'nlk-btn', disabled: modelLoading.value !== null, onClick: () => { void pullModels('embedding'); } }, modelLoading.value === 'embedding' ? '正在连接…' : embeddingModels.value.length ? '重新读取模型' : '连接并读取模型')]),
+                            embeddingModels.value.length && !embeddingManual.value
+                                ? h('select', { class: 'nlk-input nlk-model-select', value: draft.value.embeddingApi.model, onChange: (e) => { draft.value.embeddingApi.model = e.target.value; } }, embeddingModels.value.map((model) => h('option', { value: model }, model)))
+                                : embeddingManual.value
+                                    ? h('input', { class: 'nlk-input', value: draft.value.embeddingApi.model, placeholder: '仅在接口不提供 /models 时手动填写', onInput: (e) => { draft.value.embeddingApi.model = e.target.value; } })
+                                    : h('div', { class: 'nlk-model-empty' }, draft.value.embeddingApi.model ? `当前保存：${draft.value.embeddingApi.model}` : '尚未读取模型。'),
+                            h('button', { type: 'button', class: 'nlk-text-button', onClick: () => { embeddingManual.value = !embeddingManual.value; } }, embeddingManual.value ? '返回模型列表' : '接口没有模型列表？改为手动填写'),
+                        ]),
                         h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量维度'), h('input', { class: 'nlk-input', type: 'number', min: 1, max: 8192, value: draft.value.embeddingApi.dimensions ?? '', onInput: (e) => { draft.value.embeddingApi.dimensions = Number(e.target.value) || undefined; } }), h('small', { class: 'nlk-help' }, '不确定可留空，让服务自动决定。')]),
                         h('div', { class: 'nlk-field nlk-vector-action' }, [h('button', { class: 'nlk-btn', disabled: saving.value, onClick: () => { void testEmbedding(); } }, '测试向量模型')]),
                     ]) : null,
@@ -24611,17 +24747,17 @@ const ConfigView = defineComponent({
                 ]),
                 h('section', { class: 'nlk-agent-budget' }, [
                     h('div', { class: 'nlk-agent-budget-head' }, [
-                        h('div', { class: 'nlk-info-icon' }, draft.value.agent.maxRequestsPerTurn === 1 ? '1×' : `${draft.value.agent.maxRequestsPerTurn}×`),
-                        h('div', null, [h('strong', null, '每轮 AI 请求上限'), h('p', null, '这是请求次数上限，不会真的并行轰炸接口。1 次是传统单次更新；2 次以上才启用串行工具循环。')]),
-                        h('span', { class: draft.value.agent.maxRequestsPerTurn === 1 ? 'nlk-mode-badge' : 'nlk-mode-badge nlk-mode-badge-agent' }, draft.value.agent.maxRequestsPerTurn === 1 ? '单次模式' : '多步 Agent'),
+                        h('div', { class: 'nlk-info-icon' }, draft.value.tier === 'minimal' || draft.value.agent.maxRequestsPerTurn === 1 ? '1×' : `${draft.value.agent.maxRequestsPerTurn}×`),
+                        h('div', null, [h('strong', null, '每轮 AI 请求上限'), h('p', null, draft.value.tier === 'minimal' ? '极简档固定为一次：只做传统 MVU 变量更新，不运行记忆、世界推演或工具循环。' : '这是串行请求次数上限，不会并行轰炸接口。1 次是传统单次更新；2 次以上才启用工具循环。')]),
+                        h('span', { class: draft.value.tier === 'minimal' || draft.value.agent.maxRequestsPerTurn === 1 ? 'nlk-mode-badge' : 'nlk-mode-badge nlk-mode-badge-agent' }, draft.value.tier === 'minimal' ? '极简锁定' : draft.value.agent.maxRequestsPerTurn === 1 ? '单次模式' : '多步 Agent'),
                     ]),
                     h('div', { class: 'nlk-agent-controls' }, [
-                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '每轮最多请求几次（1～8）'), h('div', { class: 'nlk-range-row' }, [h('input', { type: 'range', min: 1, max: 8, step: 1, value: draft.value.agent.maxRequestsPerTurn, onInput: (e) => { draft.value.agent.maxRequestsPerTurn = Math.max(1, Math.min(8, Number(e.target.value) || 1)); } }), h('input', { class: 'nlk-input nlk-number-input', type: 'number', min: 1, max: 8, value: draft.value.agent.maxRequestsPerTurn, onInput: (e) => { draft.value.agent.maxRequestsPerTurn = Math.max(1, Math.min(8, Number(e.target.value) || 1)); } })]), h('small', { class: 'nlk-help' }, draft.value.agent.maxRequestsPerTurn === 1 ? '每轮只调用一次模型，最省 RPM 和费用。' : `模型最多做 ${draft.value.agent.maxRequestsPerTurn} 次串行决策，确认完成后会提前停止。`)]),
-                        draft.value.agent.maxRequestsPerTurn > 1 ? h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '相邻请求至少间隔'), h('div', { class: 'nlk-input-suffix' }, [h('input', { class: 'nlk-input', type: 'number', min: 0, max: 10000, step: 100, value: draft.value.agent.minRequestIntervalMs, onInput: (e) => { draft.value.agent.minRequestIntervalMs = Math.max(0, Math.min(10000, Number(e.target.value) || 0)); } }), h('span', null, '毫秒')]), h('small', { class: 'nlk-help' }, `当前理论上限约 ${draft.value.agent.minRequestIntervalMs > 0 ? Math.floor(60000 / draft.value.agent.minRequestIntervalMs) : '不限'} RPM；服务限速严格时建议 1200～3000 毫秒。`)]) : h('div', { class: 'nlk-agent-safe' }, '单次模式不会触发额外工具请求，无需设置间隔。'),
+                        h('label', { class: draft.value.tier === 'minimal' ? 'nlk-field nlk-field-locked' : 'nlk-field' }, [h('span', { class: 'nlk-label' }, draft.value.tier === 'minimal' ? '极简档请求数（固定）' : '每轮最多请求几次（1～8）'), h('div', { class: 'nlk-range-row' }, [h('input', { type: 'range', min: 1, max: 8, step: 1, disabled: draft.value.tier === 'minimal', value: draft.value.tier === 'minimal' ? 1 : draft.value.agent.maxRequestsPerTurn, onInput: (e) => { draft.value.agent.maxRequestsPerTurn = Math.max(1, Math.min(8, Number(e.target.value) || 1)); } }), h('input', { class: 'nlk-input nlk-number-input', type: 'number', min: 1, max: 8, disabled: draft.value.tier === 'minimal', value: draft.value.tier === 'minimal' ? 1 : draft.value.agent.maxRequestsPerTurn, onInput: (e) => { draft.value.agent.maxRequestsPerTurn = Math.max(1, Math.min(8, Number(e.target.value) || 1)); } })]), h('small', { class: 'nlk-help' }, draft.value.tier === 'minimal' ? '这是档位硬约束。切换到普通档后，才可以选择单次或多步 Agent。' : draft.value.agent.maxRequestsPerTurn === 1 ? '每轮只调用一次模型，最省 RPM 和费用。' : `模型最多做 ${draft.value.agent.maxRequestsPerTurn} 次串行决策，确认完成后会提前停止。`)]),
+                        draft.value.tier !== 'minimal' && draft.value.agent.maxRequestsPerTurn > 1 ? h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '相邻请求至少间隔'), h('div', { class: 'nlk-input-suffix' }, [h('input', { class: 'nlk-input', type: 'number', min: 0, max: 10000, step: 100, value: draft.value.agent.minRequestIntervalMs, onInput: (e) => { draft.value.agent.minRequestIntervalMs = Math.max(0, Math.min(10000, Number(e.target.value) || 0)); } }), h('span', null, '毫秒')]), h('small', { class: 'nlk-help' }, `当前理论上限约 ${draft.value.agent.minRequestIntervalMs > 0 ? Math.floor(60000 / draft.value.agent.minRequestIntervalMs) : '不限'} RPM；服务限速严格时建议 1200～3000 毫秒。`)]) : h('div', { class: 'nlk-agent-safe' }, draft.value.tier === 'minimal' ? '极简档不会启用额外系统或工具请求。' : '单次模式不会触发额外工具请求，无需设置间隔。'),
                     ]),
                     h('div', { class: 'nlk-row nlk-agent-save' }, [h('button', { class: 'nlk-btn nlk-btn-primary', disabled: saving.value, onClick: () => { void saveConnections(); } }, saving.value ? '保存中…' : '保存模型与运行设置')]),
                 ]),
-                h('details', { class: 'nlk-settings-fold' }, [h('summary', null, '运行档位与存储能力'),
+                h('details', { class: 'nlk-settings-fold', open: true }, [h('summary', null, '运行档位（极简只更新变量）'),
                     h('div', { class: 'nlk-tier-grid' }, [
                         ['minimal', 'standard', 'advanced'].map((tier) => h('button', {
                             key: tier,
@@ -24630,8 +24766,8 @@ const ConfigView = defineComponent({
                             disabled: pendingTier.value !== null,
                         }, [
                             h('span', { class: 'nlk-tier-icon' }, tier === 'minimal' ? '◇' : tier === 'standard' ? '◈' : '✦'),
-                            h('strong', null, tier === 'minimal' ? '极简' : tier === 'standard' ? '标准' : '进阶'),
-                            h('small', null, tier === 'minimal' ? '纯浏览器基础能力，最省心' : tier === 'standard' ? '更可靠的本地保存，推荐大多数卡' : '在可用时启用本地向量检索'),
+                            h('strong', null, tier === 'minimal' ? '极简 · 仅变量' : tier === 'standard' ? '普通 · 推荐' : '进阶 · 向量'),
+                            h('small', null, tier === 'minimal' ? '固定单次调用；记忆、世界推演和工具循环全部暂停' : tier === 'standard' ? '可按角色卡开启记忆与世界推演，也可设置多步 Agent' : '包含普通档能力，并在可用时启用向量记忆检索'),
                             h('em', null, current.tier === tier ? '当前使用' : '点击切换'),
                         ])),
                     ]),
@@ -25026,6 +25162,13 @@ const CSS = `
 .nlk-model-form { margin-top: 12px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px 12px; }
 .nlk-model-picker { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px; }
 .nlk-model-picker .nlk-btn { white-space: nowrap; }
+.nlk-model-select-step { padding: 12px; display: grid; gap: 9px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-input-bg); }
+.nlk-model-select-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.nlk-model-select-head strong, .nlk-model-select-head small { display: block; }
+.nlk-model-select-head small { margin-top: 2px; color: var(--nlk-muted); }
+.nlk-model-select { min-height: 39px; font-weight: 700; }
+.nlk-model-empty { min-height: 39px; box-sizing: border-box; padding: 10px 11px; color: var(--nlk-muted); border: 1px dashed var(--nlk-border); border-radius: 8px; background: var(--nlk-surface); }
+.nlk-text-button { width: max-content; padding: 2px 0; color: var(--nlk-accent); border: 0; background: transparent; cursor: pointer; text-align: left; font-size: 10px; }
 .nlk-vector-action { justify-content: flex-end; }
 .nlk-vector-action .nlk-btn { margin-top: auto; }
 .nlk-test-result { margin-top: 8px; padding: 7px 9px; color: var(--nlk-text); border-radius: 7px; background: var(--nlk-input-bg); overflow-wrap: anywhere; }
@@ -25041,6 +25184,7 @@ const CSS = `
 .nlk-input-suffix { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 7px; }
 .nlk-input-suffix > span { color: var(--nlk-muted); font-size: 10px; }
 .nlk-agent-safe { align-self: stretch; display: grid; place-items: center; padding: 12px; color: var(--nlk-muted); border: 1px dashed var(--nlk-border); border-radius: 9px; background: var(--nlk-surface); text-align: center; }
+.nlk-field-locked { padding: 10px; border: 1px dashed var(--nlk-border); border-radius: 9px; background: var(--nlk-input-bg); }
 .nlk-agent-save { justify-content: flex-end; margin: 11px 0 0; }
 .nlk-settings-fold { margin: 12px 0; padding: 11px 13px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
 .nlk-settings-fold > summary { color: var(--nlk-title); font-weight: 700; cursor: pointer; }
@@ -25053,12 +25197,59 @@ const CSS = `
 .nlk-ai-chip { flex: 0 0 auto; padding: 5px 9px; color: var(--nlk-text); border: 1px solid var(--nlk-border); border-radius: 99px; background: var(--nlk-surface); cursor: pointer; font-size: 10px; }
 .nlk-ai-chip:hover { border-color: var(--nlk-accent); background: var(--nlk-accent-soft); }
 .nlk-ai-prompt { min-height: 80px; }
+.nlk-ai-question-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; margin-top: 11px; }
+.nlk-ai-question { min-width: 0; padding: 10px; display: grid; gap: 5px; border: 1px solid var(--nlk-border); border-radius: 10px; background: var(--nlk-surface); }
+.nlk-ai-question-main { grid-column: 1 / -1; }
+.nlk-ai-question .nlk-help { min-height: 0; }
+.nlk-ai-question textarea { resize: vertical; }
 .nlk-ai-helper-foot { margin-top: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .nlk-ai-helper-foot span { color: var(--nlk-muted); font-size: 10px; }
 .nlk-ai-result { margin-top: 11px; padding: 10px 11px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb,#45b980 44%,var(--nlk-border)); border-radius: 9px; background: color-mix(in srgb,#45b980 9%,var(--nlk-surface)); }
 .nlk-ai-result strong, .nlk-ai-result small { display: block; }
 .nlk-ai-result small { margin-top: 2px; color: var(--nlk-muted); }
 .nlk-migration-ai { margin-top: 12px; }
+.nlk-tier-lock-callout { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.nlk-system-lock-note { display: block; margin-top: 4px; color: var(--nlk-muted); }
+.nlk-system-card:has(input:disabled) { border-style: dashed; }
+.nlk-memory-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; }
+.nlk-memory-stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; margin-bottom: 13px; }
+.nlk-memory-stat { padding: 12px 14px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
+.nlk-memory-stat strong, .nlk-memory-stat span { display: block; }
+.nlk-memory-stat strong { color: var(--nlk-title); font-size: 20px; }
+.nlk-memory-stat span { color: var(--nlk-muted); font-size: 10px; }
+.nlk-memory-tabs { display: flex; gap: 3px; padding: 3px; width: max-content; border-radius: 9px; background: var(--nlk-input-bg); }
+.nlk-memory-tab { padding: 7px 12px; color: var(--nlk-muted); border: 0; border-radius: 7px; background: transparent; cursor: pointer; }
+.nlk-memory-tab-active { color: var(--nlk-title); background: var(--nlk-surface-strong); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+.nlk-memory-toolbar { margin: 11px 0; display: grid; grid-template-columns: minmax(180px,1fr) repeat(3,minmax(115px,.4fr)) auto; gap: 7px; }
+.nlk-memory-search-result { position: relative; margin: 8px 0; padding: 11px; border: 1px solid var(--nlk-border); border-radius: 10px; background: var(--nlk-surface); }
+.nlk-memory-search-result > .nlk-icon-btn { position: absolute; top: 8px; right: 8px; }
+.nlk-memory-groups { display: grid; gap: 12px; }
+.nlk-memory-group { overflow: hidden; border: 1px solid var(--nlk-border); border-radius: 12px; background: var(--nlk-surface); }
+.nlk-memory-group-head { padding: 10px 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--nlk-border); background: var(--nlk-input-bg); }
+.nlk-memory-group-head strong, .nlk-memory-group-head small { display: block; }
+.nlk-memory-group-head small, .nlk-memory-group-head > span { color: var(--nlk-muted); }
+.nlk-memory-list { display: grid; }
+.nlk-memory-item { padding: 11px 13px; display: grid; grid-template-columns: auto minmax(180px,1fr) minmax(150px,.55fr) auto; align-items: center; gap: 11px; border-top: 1px solid var(--nlk-border); }
+.nlk-memory-item:first-child { border-top: 0; }
+.nlk-memory-item-muted { opacity: .66; }
+.nlk-memory-type-icon { width: 31px; height: 31px; display: grid; place-items: center; color: var(--nlk-accent); border-radius: 9px; background: var(--nlk-accent-soft); font-weight: 800; }
+.nlk-memory-content > div { display: flex; gap: 5px; margin-bottom: 3px; }
+.nlk-memory-content strong, .nlk-memory-content small { display: block; overflow-wrap: anywhere; }
+.nlk-memory-content small, .nlk-memory-health small { color: var(--nlk-muted); }
+.nlk-memory-status { padding: 1px 5px; border-radius: 99px; color: var(--nlk-muted); background: var(--nlk-input-bg); font-size: 9px; }
+.nlk-memory-status-active { color: #237753; background: #dff5e9; }
+.nlk-memory-meter { height: 5px; margin-top: 5px; overflow: hidden; border-radius: 99px; background: var(--nlk-input-bg); }
+.nlk-memory-meter span { display: block; height: 100%; border-radius: inherit; background: var(--nlk-accent); }
+.nlk-memory-actions { display: flex; gap: 5px; }
+.nlk-memory-table-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); gap: 11px; margin-top: 12px; }
+.nlk-memory-table-card { min-width: 0; padding: 13px; overflow: auto; border: 1px solid var(--nlk-border); border-radius: 12px; background: var(--nlk-surface); }
+.nlk-memory-table-head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 9px; margin-bottom: 10px; }
+.nlk-memory-table-head strong, .nlk-memory-table-head small { display: block; }
+.nlk-memory-table-head small, .nlk-memory-table-head > span { color: var(--nlk-muted); }
+.nlk-memory-columns, .nlk-memory-table-row { min-width: 280px; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(100px,1fr); }
+.nlk-memory-columns { color: var(--nlk-muted); background: var(--nlk-input-bg); font-size: 10px; font-weight: 700; }
+.nlk-memory-columns span, .nlk-memory-table-row span { padding: 7px 8px; border-bottom: 1px solid var(--nlk-border); overflow-wrap: anywhere; }
+.nlk-memory-empty-list { padding: 25px 15px; color: var(--nlk-muted); text-align: center; }
 .nlk-lore-browser { margin: 10px 0; padding: 13px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
 .nlk-lore-browser > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .nlk-lore-browser > div:first-child strong, .nlk-lore-browser > div:first-child small { display: block; }
@@ -25103,6 +25294,12 @@ const CSS = `
 .nlk-brand-mark, .nlk-eyebrow, .nlk-role-card em { color: var(--nlk-accent); }
 .nlk-nav-group > small, .nlk-brand small, .nlk-system-card p, .nlk-check-explain small, .nlk-card-title small, .nlk-kpi span, .nlk-status-row span { color: var(--nlk-muted); opacity: 1; }
 .nlk-shell select option { color: var(--nlk-text); background: var(--nlk-surface-strong); }
+/* 酒馆主题常给 button:hover 加亮度滤镜；工作台内统一禁用，悬停只改变边框/强调色。 */
+.nlk-shell button:hover:not(:disabled), .nlk-role-gate button:hover:not(:disabled) { filter: none !important; opacity: 1 !important; }
+.nlk-shell .nlk-btn-primary:hover:not(:disabled) { color: #fff; border-color: var(--nlk-accent); background: linear-gradient(135deg,var(--nlk-accent),color-mix(in srgb,var(--nlk-accent) 64%,#147fa3)); }
+.nlk-shell .nlk-segmented-active:hover:not(:disabled) { color: #fff; background: var(--nlk-accent); }
+.nlk-shell .nlk-nav-item:hover, .nlk-shell .nlk-field-item:hover { color: var(--nlk-title); background: var(--nlk-accent-soft); }
+.nlk-shell .nlk-memory-tab:hover, .nlk-shell .nlk-subnav:hover, .nlk-shell .nlk-ai-chip:hover, .nlk-shell .nlk-theme-choice:hover { color: var(--nlk-title); background: var(--nlk-accent-soft); }
 .nlk-theme-light .nlk-nav-active, .nlk-theme-light .nlk-field-item-active { color: #49359e; }
 .nlk-theme-light .nlk-health { color: #176e49; background: #dff5e9; }
 .nlk-theme-light .nlk-toast-ok { color: #176e49; background: #e0f5e9; }
@@ -25142,6 +25339,13 @@ const CSS = `
   .nlk-mode-badge { grid-column: 2; }
   .nlk-agent-controls { grid-template-columns: 1fr; }
   .nlk-model-picker { grid-template-columns: 1fr; }
+  .nlk-model-select-head, .nlk-tier-lock-callout, .nlk-memory-head { align-items: stretch; flex-direction: column; }
+  .nlk-ai-question-grid, .nlk-memory-stats { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .nlk-ai-question-main { grid-column: 1 / -1; }
+  .nlk-memory-toolbar { grid-template-columns: 1fr 1fr; }
+  .nlk-memory-search { grid-column: 1 / -1; }
+  .nlk-memory-item { grid-template-columns: auto minmax(0,1fr); }
+  .nlk-memory-health, .nlk-memory-actions { grid-column: 2; }
 }
 `;
 /**
@@ -25368,7 +25572,7 @@ let adapter = null;
 let startupState = 'idle';
 let startupError = null;
 let previousChatId = null;
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 /** 稳定 API 入口（每次取新鲜引用：chatMetadata 在切聊天后引用会变，文档警告不可长持） */
 function getStContext() {
     const globalObject = globalThis;

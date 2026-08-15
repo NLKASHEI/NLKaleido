@@ -3,7 +3,7 @@ import { h as hash64 } from '../index.js';
 /**
  * M14 配置便捷性核心（§20.13，玩家端一键配置；纯 JS 零依赖，防蠢优先）。
  *
- * - 三档位：极简（零配置直用）/ 标准（IndexedDB）/ 进阶（+webllm 向量可选）；
+ * - 三档位：极简（仅单次变量更新）/ 普通（可选记忆与世界推演）/ 进阶（+向量可选）；
  * - 自动探测 + 降级链（向量 → BM25 → 纯规则关键词），逐级降级不崩溃不吓玩家；
  * - 边界处理：webllm 5s 超时放弃 / quota=0 隐私模式降内存+debounce / IndexedDB 不可用回落 extension_settings；
  * - 防奶人核心四项：破坏性二次确认 + 自动备份、配置快照一键回滚、恢复出厂、资源上限保护；
@@ -12,10 +12,14 @@ import { h as hash64 } from '../index.js';
  * - 定位：前端封装，不改变底层存储/调度/注入体系；手动配置优先级高于档位自动值（§20.13.7）。
  */
 const TIER_NAMES = Object.freeze({
-    minimal: '极简模式（零配置）',
-    standard: '标准模式',
+    minimal: '极简模式（仅变量）',
+    standard: '普通模式（推荐）',
     advanced: '进阶模式',
 });
+/** 极简档只运行传统单次变量更新；可选的记忆与世界推演从普通档开始可用。 */
+function tierAllowsOptionalSystems(tier) {
+    return tier === 'standard' || tier === 'advanced';
+}
 const CONFIG_VERSION = 3;
 /** 档位 → 默认配置（§20.13.4 表） */
 function tierDefaults(tier, storage) {
@@ -108,7 +112,7 @@ function decideTier(probe, preferred = 'standard') {
         }
     }
     else {
-        degradations.push('标准/极简档：检索固定 BM25（纯 JS 零依赖）');
+        degradations.push('普通/极简档：检索固定 BM25（纯 JS 零依赖）');
     }
     if (tier === 'advanced' && retrieval !== 'vector') {
         warnings.push('进阶设置已开启；填写可选向量模型后可启用语义检索，目前使用关键词检索');
@@ -268,10 +272,12 @@ function clampConfig(config) {
         config.memory.injectTopK = RESOURCE_LIMITS.maxTopK;
         clamped.push(`注入条数超上限 → ${RESOURCE_LIMITS.maxTopK}`);
     }
-    const requests = Math.max(1, Math.min(RESOURCE_LIMITS.maxRequestsPerTurn, Math.floor(config.agent.maxRequestsPerTurn || 1)));
+    const requests = config.tier === 'minimal'
+        ? 1
+        : Math.max(1, Math.min(RESOURCE_LIMITS.maxRequestsPerTurn, Math.floor(config.agent.maxRequestsPerTurn || 1)));
     if (requests !== config.agent.maxRequestsPerTurn) {
         config.agent.maxRequestsPerTurn = requests;
-        clamped.push(`每轮 AI 请求数已限制为 ${requests}`);
+        clamped.push(config.tier === 'minimal' ? '极简档固定为单次变量更新' : `每轮 AI 请求数已限制为 ${requests}`);
     }
     const interval = Math.max(0, Math.min(RESOURCE_LIMITS.maxRequestIntervalMs, Math.floor(config.agent.minRequestIntervalMs || 0)));
     if (interval !== config.agent.minRequestIntervalMs) {
@@ -298,4 +304,4 @@ function dryRunConfig(candidate, env) {
     return { ok: errors.length === 0 || errors.every((e) => e.startsWith('资源钳制')), errors };
 }
 
-export { CONFIG_VERSION, RESOURCE_LIMITS, TIER_NAMES, applyOverrides, clampConfig, decideTier, dryRunConfig, isDestructiveAction, migrateConfig, migrateConfigV1ToV2, migrateConfigV2ToV3, probeEnvironment, runSelfCheck, takeSnapshot, tierDefaults };
+export { CONFIG_VERSION, RESOURCE_LIMITS, TIER_NAMES, applyOverrides, clampConfig, decideTier, dryRunConfig, isDestructiveAction, migrateConfig, migrateConfigV1ToV2, migrateConfigV2ToV3, probeEnvironment, runSelfCheck, takeSnapshot, tierAllowsOptionalSystems, tierDefaults };
