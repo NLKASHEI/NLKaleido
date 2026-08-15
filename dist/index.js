@@ -6342,6 +6342,7 @@ const LOOP_THRESHOLD = 3;
 async function runMultiStepAgent(transport, opts) {
     const { contract, state, turnId } = opts;
     const maxSteps = opts.maxSteps ?? contract.guardrails.maxSteps ?? 0;
+    const minStepIntervalMs = Math.max(0, opts.minStepIntervalMs ?? 0);
     const maxTokensPerStep = opts.maxTokensPerStep ?? contract.guardrails.maxTokensPerStep ?? 2048;
     const window = opts.breakerWindow ?? LOOP_WINDOW;
     const threshold = opts.breakerThreshold ?? LOOP_THRESHOLD;
@@ -6360,10 +6361,17 @@ async function runMultiStepAgent(transport, opts) {
     let stateView = await getState();
     let feedback = '尚未执行修改。请根据状态选择 apply_patch；若无需修改则 done。';
     const history = [{ action: 'get_state', result: stateView }];
+    let lastDecisionAt = 0;
     for (let step = 0; step < maxSteps; step += 1) {
         result.steps = step + 1;
         // 每一步都发真实模型决策请求，模型能看到最新 get_state 结果与工具反馈。
+        if (lastDecisionAt > 0 && minStepIntervalMs > 0) {
+            const waitMs = minStepIntervalMs - (Date.now() - lastDecisionAt);
+            if (waitMs > 0)
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
+        }
         const decision = await transport.decide({ step: step + 1, stateView, feedback, history: history.slice(-6) });
+        lastDecisionAt = Date.now();
         const stepTokens = Math.max(1, decision.tokens ?? Math.ceil(JSON.stringify(decision).length / 3));
         if (stepTokens > maxTokensPerStep || result.tokensConsumed + stepTokens > totalBudget) {
             result.status = 'max_tokens';
@@ -8348,17 +8356,44 @@ function detectVersion(globals) {
     return { compatible: missing.length === 0, missing, notes };
 }
 
+const SECTION_RULES = {
+    fields: [
+        '本次只负责变量设计：重点修改 updateRules、displayRules 与必要的 invariants，不得擅自开启 memory/plot/dice 或改动已有 ejs。',
+        '变量必须是玩家能看懂或剧情逻辑真正会使用的状态；每个变量写清默认值、可观察证据、不变化条件和边界。',
+    ],
+    ces: [
+        '本次只负责世界书联动：重点修改 ejs；除非条件确实缺少变量，否则不得改动已有变量和可选系统。',
+        '每条规则必须引用真实存在的世界书与具体条目，并使用契约里已经声明的变量；没有匹配条目就不要生成规则。',
+    ],
+    dice: [
+        '本次只负责检定规则：重点修改 dice，保持变量、ejs、memory 与 plot 原样。',
+        '根据作者描述选择 coc、dnd 或 custom，给出可直接使用的默认公式、目标值和面向玩家的结果说明；禁止发明不可执行语法。',
+    ],
+    systems: [
+        '本次只负责可选能力：按需求设置 memory、plot、dice；没有明确需求的功能保持关闭，不得重做变量和 ejs。',
+        '说明性内容必须落实为契约字段，不得只写建议；所有开启项都使用保守、低开销默认值。',
+    ],
+    migration: [
+        '本次负责审校 MVU 迁移初稿：保留确定性迁移已经提取出的所有变量和规则，不得静默删除，也不得把 MVU 命令带入运行时。',
+        '补全可观察的 changeRule、合理类型和默认值；无法可靠翻译的内容必须在 changeRule 中保留原意并以“【需人工确认】”开头。',
+        '禁止输出 _.xxx()、eval、new Function、模板执行代码或 [mvu_update] 运行逻辑；它们只能作为不可执行的迁移证据被概述。',
+    ],
+};
 /**
  * “AI 帮帮”专用创作 Skill。它不是泛化聊天提示，而是一套可审计的契约设计流程：
  * 需求拆解 → 最小变量集 → 更新证据 → 可视化默认值 → 世界书联动 → 可选系统。
  */
 function buildAuthorSkillPrompt(input) {
+    const section = input.section ?? 'fields';
     const lore = input.lorebooks.length
         ? input.lorebooks.map((book) => `${book.name}：${book.entries.map((entry) => entry.name).join('、') || '（无条目）'}`).join('\n')
         : '（当前角色没有可读取的世界书）';
     return [
-        '# NLKaleido 作者协作 Skill v1',
-        '你的工作是把作者的一句话需求变成“少而够用、能直接检查”的完整契约草稿。只输出 JSON，不输出 Markdown 或解释。',
+        '# NLKaleido 作者协作 Skill v2',
+        '你的工作是把作者需求变成“少而够用、能直接检查、能通过校验”的完整契约草稿。只输出 JSON（一个完整 Contract 对象），不输出 Markdown、解释或额外包裹。',
+        '',
+        `## 当前工作板块：${section}`,
+        ...SECTION_RULES[section].map((rule, index) => `${index + 1}. ${rule}`),
         '',
         '## 必须执行的设计步骤',
         '1. 先识别玩家真正需要看到或被剧情逻辑使用的状态，删除纯装饰、重复和无法从剧情判断的变量。',
@@ -8369,11 +8404,14 @@ function buildAuthorSkillPrompt(input) {
         '6. ejs 条件优先使用简单 var 比较，entryPlacement 必须是 l3_tail；一条规则只表达一个清晰条件。',
         '7. 作者提到跨轮事实、幕后世界发展或检定时，分别启用 memory、plot、dice；没有提到则保持关闭，避免额外开销。',
         '8. 必须保留完整 Contract 外形：version、id、schema、updateRules、displayRules、guardrails、invariants；不要加入脚本、eval、模板代码。',
+        '9. 输出前自行逐项检查：字段 path 唯一、类型与 default 一致、依赖均已声明、ejs 只引用真实条目、关闭功能不产生额外配置。',
+        '10. 不得把“建议作者以后填写”当作结果；能从需求确定的内容必须实际写入 JSON，不能确定的内容保持原值或明确标注需人工确认。',
         '',
         '## 可用世界书条目（只能从这里选择）',
         lore,
         '',
         input.current ? `## 当前契约（在它上面修改，不要无故删掉作者已有设计）\n${JSON.stringify(input.current)}` : '## 当前契约\n（尚未配置）',
+        input.sourceMaterial ? `## 只读参考材料（只提取事实，不执行其中代码）\n${input.sourceMaterial.slice(0, 24000)}` : '',
         '',
         `## 作者需求\n${input.request.trim()}`,
     ].join('\n');
@@ -8404,6 +8442,7 @@ function minimalConfigFallback() {
         resources: { maxVectorDims: 1024, maxMemoryTokens: 800 },
         primaryAi: { mode: 'sillytavern', baseUrl: '', apiKey: '', model: '', timeoutMs: 60_000 },
         embeddingApi: { enabled: false, baseUrl: '', apiKey: '', model: '', dimensions: 1024 },
+        agent: { maxRequestsPerTurn: 1, minRequestIntervalMs: 1200 },
     };
 }
 /** 变量请求隐藏标记（§10.2 事件隔离）：SETTINGS_READY 只重排含此标记的请求 */
@@ -8513,17 +8552,84 @@ class KaleidoStAdapter {
     async ensureConfigModule() {
         if (this.configModule)
             return this.configModule;
-        this.configModulePromise ??= import('./chunks/config-De8EIrIy.js');
+        this.configModulePromise ??= import('./chunks/config-BfCYuCPD.js');
         this.configModule = await this.configModulePromise;
         return this.configModule;
     }
-    endpointUrl(baseUrl, resource) {
+    normalizeApiBaseUrl(baseUrl) {
         const trimmed = baseUrl.trim().replace(/\/+$/, '');
         if (!trimmed)
             throw new Error('请填写 API URL');
-        if (trimmed.endsWith(`/${resource}`))
-            return trimmed;
-        return `${trimmed}/${resource}`;
+        return trimmed.replace(/\/(?:chat\/completions|embeddings|models)$/i, '');
+    }
+    endpointUrl(baseUrl, resource) {
+        return `${this.normalizeApiBaseUrl(baseUrl)}/${resource}`;
+    }
+    modelIds(raw) {
+        const record = raw && typeof raw === 'object' ? raw : {};
+        const rows = Array.isArray(raw)
+            ? raw
+            : Array.isArray(record.data) ? record.data
+                : Array.isArray(record.models) ? record.models : [];
+        return Array.from(new Set(rows.flatMap((item) => {
+            if (typeof item === 'string')
+                return [item.trim()];
+            if (!item || typeof item !== 'object')
+                return [];
+            const row = item;
+            const id = String(row.id ?? row.name ?? '').trim().replace(/^models\//, '');
+            return id ? [id] : [];
+        }))).sort((a, b) => a.localeCompare(b));
+    }
+    /**
+     * 拉取 OpenAI-compatible 模型列表。优先复用酒馆同源后端代理，避免浏览器 CORS；
+     * 旧版酒馆缺少代理请求头时再尝试直连 /models。
+     */
+    async listOpenAiModels(connection) {
+        const baseUrl = this.normalizeApiBaseUrl(connection.baseUrl);
+        const context = this.globals.getContext();
+        const errors = [];
+        if (typeof context.getRequestHeaders === 'function') {
+            try {
+                const response = await fetch('/api/backends/chat-completions/status', {
+                    method: 'POST',
+                    headers: context.getRequestHeaders(),
+                    body: JSON.stringify({
+                        chat_completion_source: 'custom',
+                        custom_url: baseUrl,
+                        custom_include_headers: connection.apiKey.trim()
+                            ? JSON.stringify({ Authorization: `Bearer ${connection.apiKey.trim()}` })
+                            : '',
+                    }),
+                    cache: 'no-cache',
+                });
+                if (!response.ok)
+                    throw new Error(`HTTP ${response.status} ${(await response.text()).slice(0, 180)}`);
+                const models = this.modelIds(await response.json());
+                if (models.length)
+                    return models;
+                errors.push('酒馆代理连接成功，但接口返回了空模型列表');
+            }
+            catch (error) {
+                errors.push(`酒馆代理：${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        try {
+            const response = await fetch(this.endpointUrl(baseUrl, 'models'), {
+                headers: connection.apiKey.trim() ? { Authorization: `Bearer ${connection.apiKey.trim()}` } : {},
+                cache: 'no-cache',
+            });
+            if (!response.ok)
+                throw new Error(`HTTP ${response.status} ${(await response.text()).slice(0, 180)}`);
+            const models = this.modelIds(await response.json());
+            if (models.length)
+                return models;
+            errors.push('直连接口返回了空模型列表');
+        }
+        catch (error) {
+            errors.push(`浏览器直连：${error instanceof Error ? error.message : String(error)}`);
+        }
+        throw new Error(`无法拉取模型。${errors.join('；')}`);
     }
     /**
      * NLKaleido 内部所有文本 AI 请求的统一出口。默认复用酒馆连接；作者配置独立
@@ -8542,28 +8648,56 @@ class KaleidoStAdapter {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), Math.max(5_000, ai.timeoutMs || 60_000));
         try {
-            const body = {
+            const messages = prompt.filter((message) => message.name !== VREQ_MARKER).map(({ role, content }) => ({ role, content }));
+            const directBody = {
                 model: ai.model.trim(),
-                messages: prompt.filter((message) => message.name !== VREQ_MARKER).map(({ role, content }) => ({ role, content })),
+                messages,
                 stream: false,
             };
             if (options.maxTokens)
-                body.max_tokens = options.maxTokens;
+                directBody.max_tokens = options.maxTokens;
             const schemaDoc = options.jsonSchema;
+            const schema = schemaDoc
+                ? (schemaDoc.value && typeof schemaDoc.value === 'object' ? schemaDoc.value : schemaDoc)
+                : undefined;
             if (schemaDoc) {
-                const schema = schemaDoc.value && typeof schemaDoc.value === 'object' ? schemaDoc.value : schemaDoc;
-                body.response_format = {
+                directBody.response_format = {
                     type: 'json_schema',
                     json_schema: { name: schemaDoc.name ?? 'nlkaleido_output', schema, strict: false },
                 };
             }
-            const response = await fetch(this.endpointUrl(ai.baseUrl, 'chat/completions'), {
+            const context = this.globals.getContext();
+            const canUseStProxy = typeof context.getRequestHeaders === 'function';
+            const requestUrl = canUseStProxy
+                ? '/api/backends/chat-completions/generate'
+                : this.endpointUrl(ai.baseUrl, 'chat/completions');
+            const requestBody = canUseStProxy ? {
+                chat_completion_source: 'custom',
+                custom_url: this.normalizeApiBaseUrl(ai.baseUrl),
+                custom_include_headers: ai.apiKey.trim()
+                    ? JSON.stringify({ Authorization: `Bearer ${ai.apiKey.trim()}` })
+                    : '',
+                messages,
+                model: ai.model.trim(),
+                stream: false,
+                ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
+                ...(schemaDoc ? {
+                    json_schema: {
+                        name: schemaDoc.name ?? 'nlkaleido_output',
+                        value: schema,
+                        strict: false,
+                    },
+                } : {}),
+            } : directBody;
+            const response = await fetch(requestUrl, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...(ai.apiKey.trim() ? { Authorization: `Bearer ${ai.apiKey.trim()}` } : {}),
-                },
-                body: JSON.stringify(body),
+                headers: canUseStProxy
+                    ? context.getRequestHeaders()
+                    : {
+                        'Content-Type': 'application/json',
+                        ...(ai.apiKey.trim() ? { Authorization: `Bearer ${ai.apiKey.trim()}` } : {}),
+                    },
+                body: JSON.stringify(requestBody),
                 signal: controller.signal,
             });
             if (!response.ok) {
@@ -8859,13 +8993,19 @@ class KaleidoStAdapter {
         const l0 = plotEnabled
             ? `${this.options.l0Template ?? ''}\n\n${contract.plot?.worldConstraints ?? WORLD_CONSTRAINT_TEMPLATE}`
             : this.options.l0Template;
-        // maxSteps>0 才进入真实多步链；默认 0 保持单请求、低成本路径。
+        // 玩家运行预算决定实际请求次数：1=单次模式；>1=严格串行的多步工具循环。
+        // 作者契约仍负责变量规则与每步 token 护栏，但不可以强迫玩家承担额外 RPM。
         // ST 工具按回合注册，并由 finally 保证模型报错/切聊天/中止时也不会残留到正文生成。
         let result = null;
-        if ((contract.guardrails.maxSteps ?? 0) > 0) {
+        const configuredRequests = this.adapter.config.agent?.maxRequestsPerTurn ?? 1;
+        const maxRequestsPerTurn = Math.max(1, Math.min(8, Math.floor(configuredRequests)));
+        if (maxRequestsPerTurn > 1) {
             this.registerMultiStepTools();
             try {
-                await this.requestMultiStepUpdate();
+                await this.requestMultiStepUpdate({
+                    maxSteps: maxRequestsPerTurn,
+                    minStepIntervalMs: Math.max(0, Math.min(10_000, this.adapter.config.agent?.minRequestIntervalMs ?? 1200)),
+                });
             }
             finally {
                 this.unregisterMultiStepTools();
@@ -9451,7 +9591,7 @@ class KaleidoStAdapter {
     /** 配置保存（§20.13.6：extension_settings.variables.global['nlkaleido:config']） */
     async saveConfig(config) {
         const configApi = await this.ensureConfigModule();
-        this.adapter.config = configApi.applyOverrides(config);
+        this.adapter.config = configApi.clampConfig(configApi.applyOverrides(config)).config;
         this.globalStore()[STORE_KEY_CONFIG] = this.adapter.config;
         this.globals.saveSettings();
         this.onConfigChanged?.();
@@ -9489,6 +9629,7 @@ class KaleidoStAdapter {
         // 档位只负责存储/检索能力，绝不能清空用户已经填写的模型端点。
         decision.config.primaryAi = { ...this.adapter.config.primaryAi };
         decision.config.embeddingApi = { ...this.adapter.config.embeddingApi };
+        decision.config.agent = { ...this.adapter.config.agent };
         if (decision.config.embeddingApi.enabled && decision.config.embeddingApi.baseUrl.trim() && decision.config.embeddingApi.model.trim()) {
             decision.config.retrieval = 'vector';
         }
@@ -9673,12 +9814,18 @@ class KaleidoStAdapter {
         };
     }
     /** 作者自然语言 → 可校验契约初稿；只返回草稿，用户确认保存前绝不改当前契约。 */
-    async generateContractDraft(description) {
-        const current = this.adapter.contract;
+    async generateContractDraft(description, section = 'fields', options = {}) {
+        const current = options.baseContract === undefined ? this.adapter.contract : options.baseContract;
         const lorebooks = await this.listCurrentCharacterLorebooks();
         const prompt = [
             { role: 'system', name: VREQ_MARKER, content: '' },
-            { role: 'system', content: buildAuthorSkillPrompt({ request: description, current, lorebooks }) },
+            { role: 'system', content: buildAuthorSkillPrompt({
+                    request: description,
+                    current,
+                    lorebooks,
+                    section,
+                    sourceMaterial: options.sourceMaterial,
+                }) },
         ];
         this.pendingJsonSchema = {
             name: 'nlkaleido_contract_draft',
@@ -10002,7 +10149,7 @@ class KaleidoStAdapter {
         }
         return { ok: false, error: '置信度过低未写入' };
     }
-    async requestMultiStepUpdate() {
+    async requestMultiStepUpdate(options = {}) {
         const { contract, state } = this.adapter;
         if (!contract || !state)
             return null;
@@ -10079,7 +10226,13 @@ class KaleidoStAdapter {
                     this.pendingJsonSchema = null;
                 }
             },
-        }, { contract, state, turnId: state.meta.lastTurnId + 1 });
+        }, {
+            contract,
+            state,
+            turnId: state.meta.lastTurnId + 1,
+            maxSteps: options.maxSteps,
+            minStepIntervalMs: options.minStepIntervalMs,
+        });
         if (!this.isSessionCurrent(sessionKey, state))
             throw new StaleChatSessionError();
         await this.persistState(state, sessionKey);
@@ -23447,6 +23600,7 @@ const ContractEditor = defineComponent({
         const feedbackKind = ref('info');
         const aiPrompt = ref('');
         const aiBusy = ref(false);
+        const aiGenerated = ref(false);
         const lorebooks = ref([]);
         const loreLoading = ref(false);
         const refreshLorebooks = async () => {
@@ -23482,17 +23636,20 @@ const ContractEditor = defineComponent({
         const changed = () => { dirty.value = true; feedback.value = ''; };
         const save = () => {
             if (!draft.value)
-                return;
+                return false;
             try {
                 const result = dispatch({ action: 'editContract', contract: draft.value });
                 if (!result.ok)
                     throw new Error(result.error ?? '未知校验错误');
                 store.contractText = json(draft.value);
                 dirty.value = false;
+                aiGenerated.value = false;
                 tell('契约已通过校验并进入保存队列。', 'ok');
+                return true;
             }
             catch (error) {
                 tell(error instanceof Error ? error.message : String(error), 'error');
+                return false;
             }
         };
         const exportJson = () => {
@@ -23548,10 +23705,12 @@ const ContractEditor = defineComponent({
             aiBusy.value = true;
             tell('正在让模型生成可校验草稿…');
             try {
-                draft.value = await adapter.generateContractDraft(aiPrompt.value);
+                const helperSection = section.value === 'advanced' ? 'fields' : section.value;
+                draft.value = await adapter.generateContractDraft(aiPrompt.value, helperSection);
                 selectedPath.value = Object.keys(draft.value.updateRules)[0] ?? '';
                 dirty.value = true;
-                tell('草稿已生成。请检查字段后再保存，不会自动覆盖当前契约。', 'ok');
+                aiGenerated.value = true;
+                tell('AI 方案已写入下方可视化表单，但尚未保存。检查后点击“确认应用 AI 方案”。', 'ok');
             }
             catch (error) {
                 tell(`生成失败：${error instanceof Error ? error.message : String(error)}`, 'error');
@@ -23670,11 +23829,41 @@ const ContractEditor = defineComponent({
             }
             return input('第一次使用时的值', field.type === 'number' ? Number(field.default ?? 0) : String(field.default ?? ''), (value) => patchField({ default: field.type === 'number' ? Number(value) || 0 : value }), field.type === 'number' ? { type: 'number' } : {}, field.type === 'number' ? '例如好感度从 0、生命值从 100 开始。只能输入有限数字。' : '新聊天还没有这个变量时，从这里开始。');
         };
+        const helperMeta = () => ({
+            fields: {
+                title: 'AI 帮帮 · 变量设计',
+                desc: '只设计变量、默认值和更新证据，不会擅自改世界书联动或开启额外系统。',
+                placeholder: '说明要记录什么、初始值是什么、什么剧情证据会让它变化、什么时候必须不变。例：设计角色好感度和关系阶段；只有明确帮助或伤害才变化，普通寒暄不变。',
+                quick: ['设计好感与关系阶段', '设计背包和金钱', '设计任务进度与失败条件'],
+            },
+            ces: {
+                title: 'AI 帮帮 · 世界书联动',
+                desc: '只使用当前角色真实存在的世界书条目，生成变量条件与条目启用规则。',
+                placeholder: '说明哪个变量达到什么条件时，应启用哪本世界书里的哪个条目。例：好感度达到 80 时启用“恋人阶段”，低于 60 时关闭。',
+                quick: ['按关系阶段联动条目', '按地点切换区域设定', '按任务状态启用线索'],
+            },
+            dice: {
+                title: 'AI 帮帮 · 检定规则',
+                desc: '只设计这张卡的检定系统、默认骰子和玩家可读结果说明。',
+                placeholder: '说明使用 COC、D20 还是自定义规则，成功条件和失败代价是什么。例：调查使用百分骰，失败不堵剧情但增加风险。',
+                quick: ['设计 COC 技能检定', '设计 D20 难度检定', '设计失败有代价的自定义检定'],
+            },
+            systems: {
+                title: 'AI 帮帮 · 可选功能',
+                desc: '根据用途只开启确实需要的记忆、世界推演或检定，并使用低开销默认值。',
+                placeholder: '说明希望系统额外处理什么，以及哪些功能不要开启。例：记住长期约定，每 5 轮推进幕后事件，不需要检定。',
+                quick: ['启用长期记忆', '启用世界推演和风声', '给复杂卡配置保守功能组合'],
+            },
+            advanced: {
+                title: 'AI 帮帮', desc: '', placeholder: '', quick: [],
+            },
+        }[section.value]);
         return () => {
             const contract = draft.value;
             if (!contract)
                 return h('div', { class: 'nlk-empty' }, '契约尚未加载。');
             const field = contract.updateRules[selectedPath.value];
+            const aiMeta = helperMeta();
             const nav = (key, label, count) => h('button', {
                 class: section.value === key ? 'nlk-subnav nlk-subnav-active' : 'nlk-subnav', onClick: () => { section.value = key; },
             }, `${label}${count === undefined ? '' : ` ${count}`}`);
@@ -23775,9 +23964,8 @@ const ContractEditor = defineComponent({
                     h('div', { class: 'nlk-callout' }, '勾选需要的功能后，点击页面右上角“检查并保存”才会生效。关闭的功能不会加载对应数据和计算。'),
                     systemCard('长期记忆', '让系统记住跨越很多轮的重要事实，并在相关时自动找回来。', contract.memory?.enabled === true, (on) => toggleSystem('memory', on)),
                     systemCard('世界推演', '让聊天外的事件继续发展，并把玩家可能听到的消息带回剧情。', contract.plot?.enabled === true, (on) => toggleSystem('plot', on)),
-                    h('article', { class: 'nlk-card' }, [h('div', { class: 'nlk-pane-title' }, '复杂变量推理'), h('div', { class: 'nlk-callout' }, '当变量很多、互相影响时，可以让变量 AI 分几步分析。普通角色卡保持关闭即可。'), h('div', { class: 'nlk-form-grid' }, [
-                            input('最多分析几步（0 表示关闭）', contract.guardrails.maxSteps, (value) => { contract.guardrails.maxSteps = Math.max(0, Number(value) || 0); changed(); }, { type: 'number', min: 0 }),
-                            input('每一步最多使用多少文字预算', contract.guardrails.maxTokensPerStep, (value) => { contract.guardrails.maxTokensPerStep = Math.max(128, Number(value) || 2048); changed(); }, { type: 'number', min: 128 }, '上限越高，复杂判断空间越大，模型用量也可能更高。'),
+                    h('article', { class: 'nlk-card' }, [h('div', { class: 'nlk-pane-title' }, '变量 AI 预算'), h('div', { class: 'nlk-callout' }, '每轮调用 1 次还是进入多步工具循环，由玩家在“运行设置”控制；作者这里只限制每一步能使用的输出预算。'), h('div', { class: 'nlk-form-grid' }, [
+                            input('每一步最多输出多少 token', contract.guardrails.maxTokensPerStep, (value) => { contract.guardrails.maxTokensPerStep = Math.max(128, Number(value) || 2048); changed(); }, { type: 'number', min: 128, max: 8192 }, '普通卡保持 2048 即可。它限制单次输出长度，不会增加请求次数。'),
                         ])]),
                 ]);
             }
@@ -23792,12 +23980,16 @@ const ContractEditor = defineComponent({
                     h('div', null, [h('div', { class: 'nlk-eyebrow' }, '作者设置向导'), h('h2', null, '这张卡要记录什么'), h('p', null, `${contract.id} · ${Object.keys(contract.updateRules).length} 个变量 · ${(contract.ejs ?? []).length} 条自动启用规则`)]),
                     h('div', { class: 'nlk-save-area' }, [h('span', { class: dirty.value ? 'nlk-dirty' : 'nlk-saved' }, dirty.value ? '● 有未保存修改' : '✓ 已保存'), h('button', { class: 'nlk-btn', onClick: exportJson }, '导出备份'), h('button', { class: 'nlk-btn nlk-btn-primary', onClick: save, disabled: !dirty.value }, '检查并保存')]),
                 ]),
-                h('section', { class: 'nlk-ai-helper' }, [
-                    h('div', { class: 'nlk-ai-helper-head' }, [h('div', { class: 'nlk-ai-orb' }, '✦'), h('div', null, [h('strong', null, 'AI 帮帮 · 角色卡设计助手'), h('small', null, '会按专用创作流程设计变量、更新证据、世界书联动和可选系统，只生成待检查草稿。')])]),
-                    h('div', { class: 'nlk-ai-quick' }, ['追踪角色关系与好感变化', '设计背包、金钱和任务进度', '根据当前世界书建立阶段联动', '启用世界推演并追踪风声'].map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiPrompt.value = text; } }, text))),
-                    h('textarea', { class: 'nlk-input nlk-ai-prompt', rows: 3, value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: '用自然语言描述你希望这张卡记录和自动处理什么。例：记录三名角色的好感和关系阶段；好感 80 后启用世界书“恋人阶段”；重要约定进入长期记忆。' }),
-                    h('div', { class: 'nlk-ai-helper-foot' }, [h('span', null, loreLoading.value ? '正在读取当前角色世界书…' : `可参考 ${lorebooks.value.length} 本世界书、${lorebooks.value.reduce((sum, book) => sum + book.entries.length, 0)} 个真实条目`), h('button', { class: 'nlk-btn nlk-btn-primary', disabled: aiBusy.value, onClick: generateDraft }, aiBusy.value ? '正在设计…' : '生成可检查方案')]),
-                ]),
+                section.value !== 'advanced' ? h('section', { class: 'nlk-ai-helper' }, [
+                    h('div', { class: 'nlk-ai-helper-head' }, [h('div', { class: 'nlk-ai-orb' }, '✦'), h('div', null, [h('strong', null, aiMeta.title), h('small', null, aiMeta.desc)])]),
+                    h('div', { class: 'nlk-ai-quick' }, aiMeta.quick.map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiPrompt.value = text; } }, text))),
+                    h('textarea', { class: 'nlk-input nlk-ai-prompt', rows: 3, value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: aiMeta.placeholder }),
+                    h('div', { class: 'nlk-ai-helper-foot' }, [h('span', null, loreLoading.value ? '正在读取当前角色世界书…' : `上下文：当前契约 + ${lorebooks.value.length} 本世界书、${lorebooks.value.reduce((sum, book) => sum + book.entries.length, 0)} 个真实条目`), h('button', { class: 'nlk-btn nlk-btn-primary', disabled: aiBusy.value, onClick: generateDraft }, aiBusy.value ? '正在设计…' : '生成并载入表单')]),
+                    aiGenerated.value ? h('div', { class: 'nlk-ai-result' }, [
+                        h('div', null, [h('strong', null, 'AI 方案已载入可视化表单'), h('small', null, `${Object.keys(contract.updateRules).length} 个变量 · ${(contract.ejs ?? []).length} 条世界书联动 · ${[contract.memory?.enabled ? '记忆' : '', contract.plot?.enabled ? '世界推演' : '', contract.dice?.enabled ? '检定' : ''].filter(Boolean).join('、') || '未开启额外系统'}`)]),
+                        h('button', { class: 'nlk-btn nlk-btn-primary', onClick: save }, '确认应用 AI 方案'),
+                    ]) : null,
+                ]) : null,
                 feedback.value ? h('div', { class: `nlk-toast nlk-toast-${feedbackKind.value}` }, feedback.value) : null,
                 h('nav', { class: 'nlk-subnavs' }, [nav('fields', '① 变量设计', Object.keys(contract.updateRules).length), nav('ces', '② 世界书联动', (contract.ejs ?? []).length), nav('dice', '③ 检定规则'), nav('systems', '④ 其他功能'), nav('advanced', '开发者设置')]),
                 content,
@@ -24099,11 +24291,14 @@ const MigrationView = defineComponent({
     name: 'NlMigrationView',
     setup() {
         useNlStore();
+        const adapter = useAdapter();
         const worldbookText = ref('');
         const scriptsText = ref('');
         const reportText = ref('');
         const draftText = ref('');
         const busy = ref(false);
+        const aiBusy = ref(false);
+        const aiPrompt = ref('补全每个变量可观察的更新证据、边界和不变化条件；保留所有需人工确认项。');
         const confirmImport = ref(false);
         const readUpload = async (event, target) => {
             const file = event.target.files?.[0];
@@ -24172,6 +24367,30 @@ const MigrationView = defineComponent({
                 reportText.value += `\n\n❌ JSON 解析失败：${error instanceof Error ? error.message : String(error)}`;
             }
         };
+        const improveWithAi = async () => {
+            if (!draftText.value) {
+                reportText.value = '请先完成本地检测和 ZOD 解析，再让 AI 审校确定性迁移初稿。';
+                return;
+            }
+            aiBusy.value = true;
+            try {
+                const baseContract = JSON.parse(draftText.value);
+                const sourceMaterial = [
+                    '【世界书 / MVU 规则原文】', worldbookText.value.slice(0, 12000),
+                    '【ZOD 脚本原文】', scriptsText.value.slice(0, 12000),
+                ].join('\n');
+                const improved = await adapter.generateContractDraft(aiPrompt.value.trim() || '审校迁移初稿，补全可观察规则并保留需人工确认项。', 'migration', { baseContract, sourceMaterial });
+                draftText.value = JSON.stringify(improved, null, 2);
+                reportText.value += `\n\n✅ AI 已按迁移专用规则审校初稿：保留确定性结果，补全规则，并继续标记不确定项。尚未导入。`;
+                confirmImport.value = false;
+            }
+            catch (error) {
+                reportText.value += `\n\n❌ AI 审校失败：${error instanceof Error ? error.message : String(error)}`;
+            }
+            finally {
+                aiBusy.value = false;
+            }
+        };
         return () => h('div', { class: 'nlk-section' }, [
             h('div', { class: 'nlk-hint' }, 'MVU 存量卡迁移脚手架（§24：检测 → 解析 ZOD → 提取规则 → 组装契约初稿 → 预览导入；难翻译构造显式标注，不静默丢弃）。'),
             h('div', { class: 'nlk-h3' }, '① 世界书条目（JSON 数组或 [initvar]/[mvu_update] 条目文本）'),
@@ -24183,6 +24402,12 @@ const MigrationView = defineComponent({
             h('div', { class: 'nlk-row' }, [
                 h('button', { class: 'nlk-btn', onClick: run, disabled: busy.value }, busy.value ? '迁移中…' : '③ 检测并生成迁移报告'),
                 draftText.value ? h('button', { class: confirmImport.value ? 'nlk-btn nlk-btn-primary' : 'nlk-btn', onClick: importDraft }, confirmImport.value ? '④ 确认导入' : '④ 检查后导入契约初稿') : null,
+            ]),
+            h('section', { class: 'nlk-ai-helper nlk-migration-ai' }, [
+                h('div', { class: 'nlk-ai-helper-head' }, [h('div', { class: 'nlk-ai-orb' }, 'AI'), h('div', null, [h('strong', null, 'AI 帮帮 · ZOD 迁移审校'), h('small', null, '先由本地解析器完整提取，再让 AI 补全语义；AI 无权删除变量、执行旧脚本或静默猜测。')])]),
+                h('div', { class: 'nlk-ai-quick' }, ['补全更新证据和边界', '梳理变量分组与玩家显示', '保留并解释需人工确认规则'].map((text) => h('button', { class: 'nlk-ai-chip', onClick: () => { aiPrompt.value = text; } }, text))),
+                h('textarea', { class: 'nlk-input nlk-ai-prompt', rows: 3, value: aiPrompt.value, onInput: (e) => { aiPrompt.value = e.target.value; }, placeholder: '告诉 AI 重点审校什么，例如：保留所有变量，把好感相关规则改成可从剧情观察的证据，不确定的旧命令继续标记需人工确认。' }),
+                h('div', { class: 'nlk-ai-helper-foot' }, [h('span', null, draftText.value ? '确定性迁移初稿已就绪，AI 结果仍需手动确认导入' : '先点击“检测并生成迁移报告”'), h('button', { class: 'nlk-btn nlk-btn-primary', disabled: aiBusy.value || !draftText.value, onClick: () => { void improveWithAi(); } }, aiBusy.value ? '正在审校…' : '用 AI 审校初稿')]),
             ]),
             reportText.value ? h('pre', { class: 'nlk-pre' }, reportText.value) : null,
             draftText.value ? h('div', { class: 'nlk-h3' }, '契约初稿（可编辑后导入）') : null,
@@ -24199,6 +24424,9 @@ const ConfigView = defineComponent({
         const actionMessage = ref('');
         const primaryTest = ref('');
         const embeddingTest = ref('');
+        const primaryModels = ref([]);
+        const embeddingModels = ref([]);
+        const modelLoading = ref(null);
         const saving = ref(false);
         const confirmReset = ref(false);
         const pendingTier = ref(null);
@@ -24253,7 +24481,38 @@ const ConfigView = defineComponent({
                 return '启用向量模型后，请填写向量 API URL。';
             if (vector.enabled && !vector.model.trim())
                 return '启用向量模型后，请填写向量模型名。';
+            if (draft.value.agent.maxRequestsPerTurn < 1 || draft.value.agent.maxRequestsPerTurn > 8)
+                return '每轮 AI 请求上限只能是 1～8。';
             return null;
+        };
+        const pullModels = async (kind) => {
+            const connection = kind === 'primary' ? draft.value.primaryAi : draft.value.embeddingApi;
+            if (!connection.baseUrl.trim()) {
+                actionMessage.value = '先填写 API URL，再拉取模型。';
+                return;
+            }
+            modelLoading.value = kind;
+            actionMessage.value = '正在通过酒馆后端读取 /models…';
+            try {
+                const models = await adapter.listOpenAiModels({ baseUrl: connection.baseUrl, apiKey: connection.apiKey });
+                if (kind === 'primary') {
+                    primaryModels.value = models;
+                    if (!draft.value.primaryAi.model && models[0])
+                        draft.value.primaryAi.model = models[0];
+                }
+                else {
+                    embeddingModels.value = models;
+                    if (!draft.value.embeddingApi.model && models[0])
+                        draft.value.embeddingApi.model = models[0];
+                }
+                actionMessage.value = `已拉取 ${models.length} 个模型，可搜索或手动填写。`;
+            }
+            catch (error) {
+                actionMessage.value = error instanceof Error ? error.message : String(error);
+            }
+            finally {
+                modelLoading.value = null;
+            }
         };
         const saveConnections = async () => {
             const invalid = validateConnections();
@@ -24321,7 +24580,7 @@ const ConfigView = defineComponent({
                     h('div', { class: 'nlk-setup-line' }),
                     h('div', { class: 'nlk-setup-step' }, [h('b', null, '2'), h('span', null, [h('strong', null, '向量模型'), h('small', null, draft.value.embeddingApi.enabled ? draft.value.embeddingApi.model || '待配置' : '可选，当前关闭')])]),
                     h('div', { class: 'nlk-setup-line' }),
-                    h('div', { class: 'nlk-setup-step' }, [h('b', null, '3'), h('span', null, [h('strong', null, '运行档位'), h('small', null, `当前${TIER_LABEL[current.tier] ?? current.tier}档`)])]),
+                    h('div', { class: 'nlk-setup-step' }, [h('b', null, '3'), h('span', null, [h('strong', null, '请求模式'), h('small', null, draft.value.agent.maxRequestsPerTurn === 1 ? '单次更新' : `串行 ${draft.value.agent.maxRequestsPerTurn} 次`)])]),
                 ]),
                 h('section', { class: 'nlk-model-card' }, [
                     h('div', { class: 'nlk-model-card-head' }, [h('div', { class: 'nlk-info-icon' }, 'AI'), h('div', null, [h('strong', null, '主 AI · 必填'), h('p', null, '只配置这一套，就会供变量更新、世界风声、记忆整理和 AI 帮帮共同使用。')])]),
@@ -24332,8 +24591,8 @@ const ConfigView = defineComponent({
                     draft.value.primaryAi.mode === 'sillytavern'
                         ? h('div', { class: 'nlk-callout' }, '无需重复填写 Key。万花筒会调用酒馆当前已连接的聊天模型；请先在酒馆 API 连接页确认模型可正常回复。')
                         : h('div', { class: 'nlk-model-form' }, [
-                            h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, 'API URL'), h('input', { class: 'nlk-input', value: draft.value.primaryAi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.primaryAi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '填写到 /v1 即可，系统会自动请求 /chat/completions。接口需允许浏览器跨域访问。')]),
-                            h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '模型名'), h('input', { class: 'nlk-input', value: draft.value.primaryAi.model, placeholder: '例如 gpt-4.1-mini', onInput: (e) => { draft.value.primaryAi.model = e.target.value; } })]),
+                            h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, 'API URL'), h('input', { class: 'nlk-input', value: draft.value.primaryAi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.primaryAi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '填写到 /v1 或完整 /chat/completions 都可以。拉模型和实际生成都会经酒馆后端代理，不受浏览器跨域限制。')]),
+                            h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '模型'), h('div', { class: 'nlk-model-picker' }, [h('input', { class: 'nlk-input', list: 'nlk-primary-models', value: draft.value.primaryAi.model, placeholder: '拉取或手动填写模型名', onInput: (e) => { draft.value.primaryAi.model = e.target.value; } }), h('button', { type: 'button', class: 'nlk-btn', disabled: modelLoading.value !== null, onClick: () => { void pullModels('primary'); } }, modelLoading.value === 'primary' ? '拉取中…' : '拉取模型'), h('datalist', { id: 'nlk-primary-models' }, primaryModels.value.map((model) => h('option', { value: model })))]), h('small', { class: 'nlk-help' }, primaryModels.value.length ? `已读取 ${primaryModels.value.length} 个模型，可输入关键词筛选。` : '接口不支持 /models 时仍可手动填写。')]),
                             h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'API Key'), h('input', { class: 'nlk-input', type: 'password', autocomplete: 'off', value: draft.value.primaryAi.apiKey, placeholder: '本地无鉴权接口可留空', onInput: (e) => { draft.value.primaryAi.apiKey = e.target.value; } })]),
                         ]),
                     h('div', { class: 'nlk-row' }, [h('button', { class: 'nlk-btn nlk-btn-primary', disabled: saving.value, onClick: () => { void saveConnections(); } }, saving.value ? '保存中…' : '保存设置'), h('button', { class: 'nlk-btn', disabled: saving.value, onClick: () => { void testPrimary(); } }, '测试主 AI')]),
@@ -24342,13 +24601,25 @@ const ConfigView = defineComponent({
                 h('section', { class: draft.value.embeddingApi.enabled ? 'nlk-model-card nlk-model-card-enabled' : 'nlk-model-card' }, [
                     h('div', { class: 'nlk-model-card-head' }, [h('div', { class: 'nlk-info-icon' }, 'V'), h('div', null, [h('strong', null, '向量模型 · 可选'), h('p', null, '只用于更精细的长期记忆检索。关闭时自动使用关键词检索，不会影响变量和世界书。')]), h('label', { class: 'nlk-switch-line' }, [h('input', { type: 'checkbox', checked: draft.value.embeddingApi.enabled, onChange: (e) => { draft.value.embeddingApi.enabled = e.target.checked; } }), draft.value.embeddingApi.enabled ? '已启用' : '未启用'])]),
                     draft.value.embeddingApi.enabled ? h('div', { class: 'nlk-model-form' }, [
-                        h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, '向量 API URL'), h('input', { class: 'nlk-input', value: draft.value.embeddingApi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.embeddingApi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '系统会自动请求 /embeddings。')]),
-                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量模型名'), h('input', { class: 'nlk-input', value: draft.value.embeddingApi.model, placeholder: '例如 text-embedding-3-small', onInput: (e) => { draft.value.embeddingApi.model = e.target.value; } })]),
+                        h('label', { class: 'nlk-field nlk-form-span' }, [h('span', { class: 'nlk-label' }, '向量 API URL'), h('input', { class: 'nlk-input', value: draft.value.embeddingApi.baseUrl, placeholder: 'https://api.example.com/v1', onInput: (e) => { draft.value.embeddingApi.baseUrl = e.target.value; } }), h('small', { class: 'nlk-help' }, '系统会自动请求 /embeddings；模型列表从同一地址的 /models 读取。')]),
+                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量模型'), h('div', { class: 'nlk-model-picker' }, [h('input', { class: 'nlk-input', list: 'nlk-embedding-models', value: draft.value.embeddingApi.model, placeholder: '拉取或手动填写模型名', onInput: (e) => { draft.value.embeddingApi.model = e.target.value; } }), h('button', { type: 'button', class: 'nlk-btn', disabled: modelLoading.value !== null, onClick: () => { void pullModels('embedding'); } }, modelLoading.value === 'embedding' ? '拉取中…' : '拉取模型'), h('datalist', { id: 'nlk-embedding-models' }, embeddingModels.value.map((model) => h('option', { value: model })))]), h('small', { class: 'nlk-help' }, embeddingModels.value.length ? `已读取 ${embeddingModels.value.length} 个模型。` : '某些服务不会标记模型类型，请选择明确的 embedding 模型。')]),
                         h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, 'API Key'), h('input', { class: 'nlk-input', type: 'password', autocomplete: 'off', value: draft.value.embeddingApi.apiKey, placeholder: '本地无鉴权接口可留空', onInput: (e) => { draft.value.embeddingApi.apiKey = e.target.value; } })]),
                         h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '向量维度'), h('input', { class: 'nlk-input', type: 'number', min: 1, max: 8192, value: draft.value.embeddingApi.dimensions ?? '', onInput: (e) => { draft.value.embeddingApi.dimensions = Number(e.target.value) || undefined; } }), h('small', { class: 'nlk-help' }, '不确定可留空，让服务自动决定。')]),
                         h('div', { class: 'nlk-field nlk-vector-action' }, [h('button', { class: 'nlk-btn', disabled: saving.value, onClick: () => { void testEmbedding(); } }, '测试向量模型')]),
                     ]) : null,
                     embeddingTest.value ? h('div', { class: 'nlk-test-result' }, embeddingTest.value) : null,
+                ]),
+                h('section', { class: 'nlk-agent-budget' }, [
+                    h('div', { class: 'nlk-agent-budget-head' }, [
+                        h('div', { class: 'nlk-info-icon' }, draft.value.agent.maxRequestsPerTurn === 1 ? '1×' : `${draft.value.agent.maxRequestsPerTurn}×`),
+                        h('div', null, [h('strong', null, '每轮 AI 请求上限'), h('p', null, '这是请求次数上限，不会真的并行轰炸接口。1 次是传统单次更新；2 次以上才启用串行工具循环。')]),
+                        h('span', { class: draft.value.agent.maxRequestsPerTurn === 1 ? 'nlk-mode-badge' : 'nlk-mode-badge nlk-mode-badge-agent' }, draft.value.agent.maxRequestsPerTurn === 1 ? '单次模式' : '多步 Agent'),
+                    ]),
+                    h('div', { class: 'nlk-agent-controls' }, [
+                        h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '每轮最多请求几次（1～8）'), h('div', { class: 'nlk-range-row' }, [h('input', { type: 'range', min: 1, max: 8, step: 1, value: draft.value.agent.maxRequestsPerTurn, onInput: (e) => { draft.value.agent.maxRequestsPerTurn = Math.max(1, Math.min(8, Number(e.target.value) || 1)); } }), h('input', { class: 'nlk-input nlk-number-input', type: 'number', min: 1, max: 8, value: draft.value.agent.maxRequestsPerTurn, onInput: (e) => { draft.value.agent.maxRequestsPerTurn = Math.max(1, Math.min(8, Number(e.target.value) || 1)); } })]), h('small', { class: 'nlk-help' }, draft.value.agent.maxRequestsPerTurn === 1 ? '每轮只调用一次模型，最省 RPM 和费用。' : `模型最多做 ${draft.value.agent.maxRequestsPerTurn} 次串行决策，确认完成后会提前停止。`)]),
+                        draft.value.agent.maxRequestsPerTurn > 1 ? h('label', { class: 'nlk-field' }, [h('span', { class: 'nlk-label' }, '相邻请求至少间隔'), h('div', { class: 'nlk-input-suffix' }, [h('input', { class: 'nlk-input', type: 'number', min: 0, max: 10000, step: 100, value: draft.value.agent.minRequestIntervalMs, onInput: (e) => { draft.value.agent.minRequestIntervalMs = Math.max(0, Math.min(10000, Number(e.target.value) || 0)); } }), h('span', null, '毫秒')]), h('small', { class: 'nlk-help' }, `当前理论上限约 ${draft.value.agent.minRequestIntervalMs > 0 ? Math.floor(60000 / draft.value.agent.minRequestIntervalMs) : '不限'} RPM；服务限速严格时建议 1200～3000 毫秒。`)]) : h('div', { class: 'nlk-agent-safe' }, '单次模式不会触发额外工具请求，无需设置间隔。'),
+                    ]),
+                    h('div', { class: 'nlk-row nlk-agent-save' }, [h('button', { class: 'nlk-btn nlk-btn-primary', disabled: saving.value, onClick: () => { void saveConnections(); } }, saving.value ? '保存中…' : '保存模型与运行设置')]),
                 ]),
                 h('details', { class: 'nlk-settings-fold' }, [h('summary', null, '运行档位与存储能力'),
                     h('div', { class: 'nlk-tier-grid' }, [
@@ -24601,13 +24872,13 @@ const CSS = `
 .nlk-role-intro { max-width: 680px; text-align: center; justify-self: center; }
 .nlk-role-intro .nlk-role-mark { margin: 0 auto 13px; width: 48px; height: 48px; font-size: 27px; }
 .nlk-role-intro h1 { margin: 0 0 8px; color: #fff; font-size: clamp(25px, 4vw, 36px); }
-.nlk-role-intro p { margin: 0 auto; max-width: 610px; opacity: .62; font-size: 14px; }
+.nlk-role-intro p { margin: 0 auto; max-width: 610px; color: var(--nlk-muted); font-size: 14px; }
 .nlk-role-grid { width: min(760px, 88vw); display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; }
 .nlk-role-card { min-height: 220px; padding: 24px; display: flex; flex-direction: column; align-items: flex-start; gap: 9px; text-align: left; color: inherit; border: 1px solid rgba(255,255,255,.11); border-radius: 17px; background: rgba(255,255,255,.04); cursor: pointer; transition: transform .15s ease, border-color .15s ease, background .15s ease; }
 .nlk-role-card:hover { transform: translateY(-3px); border-color: rgba(161,132,255,.48); background: rgba(135,101,255,.09); }
 .nlk-role-card .nlk-role-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 12px; color: #cfc2ff; background: rgba(131,96,255,.2); font-size: 21px; }
 .nlk-role-card strong { margin-top: 7px; color: #fff; font-size: 20px; }
-.nlk-role-card p { margin: 0; opacity: .57; line-height: 1.65; }
+.nlk-role-card p { margin: 0; color: var(--nlk-muted); line-height: 1.65; }
 .nlk-role-card em { margin-top: auto; color: #b9a8ff; font-style: normal; font-weight: 700; }
 .nlk-root {
   display: grid; grid-template-columns: 190px minmax(0, 1fr); min-height: 100%;
@@ -24618,53 +24889,53 @@ const CSS = `
 .nlk-sidebar { position: sticky; top: 0; height: 100%; min-height: 650px; box-sizing: border-box; padding: 18px 12px; background: rgba(8,9,14,.38); border-right: 1px solid rgba(255,255,255,.09); display: flex; flex-direction: column; gap: 16px; }
 .nlk-brand { display: flex; align-items: center; gap: 10px; padding: 0 8px 10px; }
 .nlk-brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; color: #b9a3ff; background: linear-gradient(145deg, rgba(126,90,255,.35), rgba(46,195,255,.18)); font-size: 21px; }
-.nlk-brand strong, .nlk-brand small { display: block; } .nlk-brand strong { font-size: 15px; } .nlk-brand small { opacity: .45; letter-spacing: .12em; font-size: 9px; }
+.nlk-brand strong, .nlk-brand small { display: block; } .nlk-brand strong { font-size: 15px; } .nlk-brand small { color: var(--nlk-muted); letter-spacing: .12em; font-size: 9px; }
 .nlk-role-current { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 7px 9px; border: 1px solid rgba(166,139,255,.15); border-radius: 8px; background: rgba(133,102,230,.07); color: #d7cefa; font-size: 11px; }
 .nlk-role-current button { padding: 2px 5px; color: inherit; border: 0; background: transparent; opacity: .58; cursor: pointer; }
 .nlk-role-current button:hover { opacity: 1; }
-.nlk-nav-group { display: flex; flex-direction: column; gap: 4px; } .nlk-nav-group > small { padding: 0 10px 4px; opacity: .4; text-transform: uppercase; letter-spacing: .12em; font-size: 9px; }
+.nlk-nav-group { display: flex; flex-direction: column; gap: 4px; } .nlk-nav-group > small { padding: 0 10px 4px; color: var(--nlk-muted); text-transform: uppercase; letter-spacing: .12em; font-size: 9px; }
 .nlk-nav-item { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
 .nlk-nav-item:hover { background: rgba(255,255,255,.06); } .nlk-nav-active { color: #d8ceff; background: rgba(123,92,255,.17) !important; box-shadow: inset 2px 0 #9f83ff; }
 .nlk-nav-icon { width: 18px; text-align: center; opacity: .85; font-size: 14px; }
-.nlk-sidebar-foot { margin-top: auto; padding: 10px; border-radius: 8px; background: rgba(255,255,255,.04); font-size: 10px; opacity: .7; }
+.nlk-sidebar-foot { margin-top: auto; padding: 10px; color: var(--nlk-muted); border-radius: 8px; background: rgba(255,255,255,.04); font-size: 10px; }
 .nlk-main { min-width: 0; padding: 22px 24px 44px; }
 .nlk-dashboard-hero, .nlk-author-hero { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
-.nlk-dashboard-hero h2, .nlk-author-hero h2 { margin: 2px 0; font-size: 23px; color: #fff; } .nlk-dashboard-hero p, .nlk-author-hero p { margin: 0; opacity: .5; }
+.nlk-dashboard-hero h2, .nlk-author-hero h2 { margin: 2px 0; font-size: 23px; color: #fff; } .nlk-dashboard-hero p, .nlk-author-hero p { margin: 0; color: var(--nlk-muted); }
 .nlk-eyebrow { color: #a990ff; font-size: 9px; letter-spacing: .17em; font-weight: 800; }
 .nlk-health { padding: 6px 10px; border-radius: 99px; background: rgba(73,203,137,.09); color: #76dfa9; font-size: 11px; }
 .nlk-health-dot { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #5bd79b; box-shadow: 0 0 8px #5bd79b; }
 .nlk-kpis { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }
-.nlk-kpi { padding: 13px 15px; border: 1px solid rgba(255,255,255,.08); border-radius: 11px; background: rgba(255,255,255,.035); } .nlk-kpi strong, .nlk-kpi span { display: block; } .nlk-kpi strong { color: #fff; font-size: 21px; } .nlk-kpi span { opacity: .47; font-size: 10px; }
+.nlk-kpi { padding: 13px 15px; border: 1px solid rgba(255,255,255,.08); border-radius: 11px; background: rgba(255,255,255,.035); } .nlk-kpi strong, .nlk-kpi span { display: block; } .nlk-kpi strong { color: #fff; font-size: 21px; } .nlk-kpi span { color: var(--nlk-muted); font-size: 10px; }
 .nlk-kpi-warn strong { color: #ffc46b; }
 .nlk-status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 14px 0; }
 .nlk-status-card, .nlk-card { padding: 14px 16px; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; background: rgba(255,255,255,.035); box-shadow: 0 8px 24px rgba(0,0,0,.09); }
-.nlk-card-title, .nlk-pane-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; color: #fff; font-weight: 700; } .nlk-card-title small { opacity: .4; font-weight: 400; }
-.nlk-status-row { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-top: 1px solid rgba(255,255,255,.055); } .nlk-status-row span { opacity: .62; } .nlk-status-row strong { color: #f4f1ff; text-align: right; overflow-wrap: anywhere; }
-.nlk-achievement-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(190px,1fr)); gap: 8px; } .nlk-achievement { display: flex; gap: 10px; padding: 10px; opacity: .35; filter: grayscale(1); border-radius: 9px; background: rgba(255,255,255,.03); } .nlk-achievement-on { opacity: 1; filter: none; background: rgba(150,116,255,.11); } .nlk-achievement strong, .nlk-achievement small { display: block; } .nlk-achievement small { opacity: .55; }
-.nlk-empty-state { min-height: 480px; display: grid; place-content: center; justify-items: center; text-align: center; } .nlk-empty-state h2 { margin: 8px 0 2px; } .nlk-empty-state p { max-width: 390px; opacity: .55; } .nlk-empty-icon { font-size: 44px; color: #9f83ff; }
+.nlk-card-title, .nlk-pane-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; color: #fff; font-weight: 700; } .nlk-card-title small { color: var(--nlk-muted); font-weight: 400; }
+.nlk-status-row { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-top: 1px solid rgba(255,255,255,.055); } .nlk-status-row span { color: var(--nlk-muted); } .nlk-status-row strong { color: #f4f1ff; text-align: right; overflow-wrap: anywhere; }
+.nlk-achievement-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(190px,1fr)); gap: 8px; } .nlk-achievement { display: flex; gap: 10px; padding: 10px; opacity: .35; filter: grayscale(1); border-radius: 9px; background: rgba(255,255,255,.03); } .nlk-achievement-on { opacity: 1; filter: none; background: rgba(150,116,255,.11); } .nlk-achievement strong, .nlk-achievement small { display: block; } .nlk-achievement small { color: var(--nlk-muted); }
+.nlk-empty-state { min-height: 480px; display: grid; place-content: center; justify-items: center; text-align: center; } .nlk-empty-state h2 { margin: 8px 0 2px; } .nlk-empty-state p { max-width: 390px; color: var(--nlk-muted); } .nlk-empty-icon { font-size: 44px; color: #9f83ff; }
 .nlk-save-area { display: flex; align-items: center; gap: 8px; } .nlk-dirty { color: #ffc46b; font-size: 10px; } .nlk-saved { color: #6ddba4; font-size: 10px; }
 .nlk-btn { min-height: 30px; padding: 5px 11px; border-radius: 7px; } .nlk-btn-primary { border-color: #896cff; background: linear-gradient(135deg,#7657e8,#4b74c9); color: white; } .nlk-btn:disabled { cursor: not-allowed; opacity: .38; } .nlk-danger { color: #ff8d9a; }
-.nlk-ai-draft { display: grid; grid-template-columns: 190px minmax(180px,1fr) auto; align-items: center; gap: 10px; margin-bottom: 14px; padding: 11px 13px; border: 1px solid rgba(162,130,255,.18); border-radius: 11px; background: linear-gradient(90deg,rgba(125,92,255,.1),rgba(45,151,207,.05)); } .nlk-ai-draft strong, .nlk-ai-draft small { display: block; } .nlk-ai-draft small { opacity: .45; }
+.nlk-ai-draft { display: grid; grid-template-columns: 190px minmax(180px,1fr) auto; align-items: center; gap: 10px; margin-bottom: 14px; padding: 11px 13px; border: 1px solid rgba(162,130,255,.18); border-radius: 11px; background: linear-gradient(90deg,rgba(125,92,255,.1),rgba(45,151,207,.05)); } .nlk-ai-draft strong, .nlk-ai-draft small { display: block; } .nlk-ai-draft small { color: var(--nlk-muted); }
 .nlk-input, .nlk-code-editor { width: 100%; box-sizing: border-box; min-height: 34px; padding: 7px 9px; color: #eee; border: 1px solid rgba(255,255,255,.13); border-radius: 7px; background: rgba(0,0,0,.2); outline: none; } .nlk-input:focus, .nlk-code-editor:focus { border-color: #8b70e8; box-shadow: 0 0 0 2px rgba(139,112,232,.12); }
 .nlk-textarea { min-height: 72px; resize: vertical; } .nlk-code-editor { min-height: 450px; resize: vertical; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .nlk-subnavs { display: flex; gap: 3px; margin-bottom: 14px; padding: 3px; width: max-content; max-width: 100%; border-radius: 9px; background: rgba(0,0,0,.22); } .nlk-subnav { padding: 7px 12px; color: inherit; border: 0; border-radius: 7px; background: transparent; cursor: pointer; } .nlk-subnav-active { color: #fff; background: rgba(255,255,255,.09); box-shadow: 0 1px 4px rgba(0,0,0,.25); }
 .nlk-author-grid { display: grid; grid-template-columns: 220px minmax(0,1fr); min-height: 430px; overflow: hidden; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; background: rgba(255,255,255,.025); }
 .nlk-field-list { padding: 13px 10px; border-right: 1px solid rgba(255,255,255,.08); background: rgba(0,0,0,.13); } .nlk-icon-btn { width: 25px; height: 25px; color: white; border: 0; border-radius: 7px; background: rgba(145,111,255,.3); cursor:pointer; }
-.nlk-field-group { margin: 9px 0; } .nlk-group-name { padding: 3px 8px; opacity: .38; font-size: 9px; text-transform: uppercase; letter-spacing: .1em; } .nlk-field-item { display: flex; justify-content: space-between; width: 100%; padding: 7px 8px; color: inherit; border: 0; border-radius: 7px; background: transparent; text-align: left; cursor:pointer; } .nlk-field-item small { opacity: .38; } .nlk-field-item:hover { background: rgba(255,255,255,.05); } .nlk-field-item-active { color: #d9cfff; background: rgba(126,92,255,.15) !important; }
+.nlk-field-group { margin: 9px 0; } .nlk-group-name { padding: 3px 8px; color: var(--nlk-muted); font-size: 9px; text-transform: uppercase; letter-spacing: .1em; } .nlk-field-item { display: flex; justify-content: space-between; width: 100%; padding: 7px 8px; color: inherit; border: 0; border-radius: 7px; background: transparent; text-align: left; cursor:pointer; } .nlk-field-item small { color: var(--nlk-muted); } .nlk-field-item:hover { background: rgba(255,255,255,.05); } .nlk-field-item-active { color: #d9cfff; background: rgba(126,92,255,.15) !important; }
 .nlk-editor-pane { padding: 15px 18px; } .nlk-form-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 13px 14px; margin-bottom: 14px; } .nlk-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; } .nlk-label { color: rgba(255,255,255,.8); font-size: 11px; font-weight: 700; } .nlk-help { display: block; min-height: 2.8em; color: rgba(255,255,255,.4); font-size: 10px; line-height: 1.4; font-weight: 400; } .nlk-check { display: flex; align-items: center; gap: 6px; align-self: end; min-height: 34px; }
 .nlk-check-explain { align-self: stretch; padding: 9px 10px; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; background: rgba(255,255,255,.025); }
 .nlk-check-explain input { flex: 0 0 auto; }
 .nlk-check-explain strong, .nlk-check-explain small { display: block; }
-.nlk-check-explain small { margin-top: 2px; opacity: .45; line-height: 1.4; }
+.nlk-check-explain small { margin-top: 2px; color: var(--nlk-muted); line-height: 1.4; }
 .nlk-api-card { margin-top: 14px; padding: 13px; display: grid; grid-template-columns: minmax(180px, .8fr) minmax(260px, 1.2fr); gap: 14px; align-items: center; border: 1px solid rgba(105,196,172,.19); border-radius: 10px; background: rgba(68,170,143,.06); }
 .nlk-api-card strong, .nlk-api-card small { display: block; }
-.nlk-api-card small { margin-top: 4px; opacity: .52; }
+.nlk-api-card small { margin-top: 4px; color: var(--nlk-muted); }
 .nlk-api-card code { padding: 10px; overflow: auto; white-space: pre; border-radius: 7px; color: #bcf2dc; background: rgba(0,0,0,.28); font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .nlk-stack { display: flex; flex-direction: column; gap: 10px; } .nlk-callout { padding: 9px 11px; border-left: 2px solid #8870df; border-radius: 5px; background: rgba(126,98,224,.08); color: rgba(255,255,255,.7); } .nlk-callout-warn { border-color: #dca85c; background: rgba(220,168,92,.08); }
-.nlk-system-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 16px; border: 1px solid rgba(255,255,255,.08); border-radius: 11px; background: rgba(255,255,255,.025); } .nlk-system-card p { margin: 3px 0 0; opacity: .48; } .nlk-system-on { border-color: rgba(120,213,169,.25); background: rgba(70,180,129,.055); }
+.nlk-system-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 16px; border: 1px solid rgba(255,255,255,.08); border-radius: 11px; background: rgba(255,255,255,.025); } .nlk-system-card p { margin: 3px 0 0; color: var(--nlk-muted); } .nlk-system-on { border-color: rgba(120,213,169,.25); background: rgba(70,180,129,.055); }
 .nlk-switch input { width: 18px; height: 18px; accent-color: #866bea; } .nlk-row-tight { margin: 0; gap: 5px; }
 .nlk-toast { margin-bottom: 10px; padding: 9px 11px; border-radius: 8px; } .nlk-toast-ok { color: #8be5b6; background: rgba(68,185,125,.11); } .nlk-toast-error { color: #ff9ba5; background: rgba(220,72,91,.11); } .nlk-toast-info { color: #b8caff; background: rgba(82,118,210,.11); }
-.nlk-technical { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 10px; } .nlk-technical > summary { cursor: pointer; opacity: .65; }
+.nlk-technical { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 10px; } .nlk-technical > summary { color: var(--nlk-muted); cursor: pointer; }
 .nlkaleido-mount-error { padding: 16px; color: var(--red, #f66); white-space: pre-wrap; }
 .nlk-shell, .nlk-root, .nlk-role-gate { color: var(--nlk-text); background-color: var(--nlk-bg); }
 .nlk-role-gate { background-image: radial-gradient(circle at 50% 10%, var(--nlk-accent-soft), transparent 44%); }
@@ -24753,9 +25024,24 @@ const CSS = `
 .nlk-model-card-head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 11px; }
 .nlk-model-card-head p { margin: 2px 0 0; color: var(--nlk-muted); }
 .nlk-model-form { margin-top: 12px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px 12px; }
+.nlk-model-picker { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px; }
+.nlk-model-picker .nlk-btn { white-space: nowrap; }
 .nlk-vector-action { justify-content: flex-end; }
 .nlk-vector-action .nlk-btn { margin-top: auto; }
 .nlk-test-result { margin-top: 8px; padding: 7px 9px; color: var(--nlk-text); border-radius: 7px; background: var(--nlk-input-bg); overflow-wrap: anywhere; }
+.nlk-agent-budget { margin: 11px 0; padding: 16px 17px; border: 1px solid color-mix(in srgb,var(--nlk-accent) 30%,var(--nlk-border)); border-radius: 13px; background: linear-gradient(135deg,var(--nlk-surface),var(--nlk-accent-soft)); }
+.nlk-agent-budget-head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 11px; }
+.nlk-agent-budget-head p { margin: 2px 0 0; color: var(--nlk-muted); }
+.nlk-mode-badge { padding: 5px 9px; color: var(--nlk-text); border: 1px solid var(--nlk-border); border-radius: 99px; background: var(--nlk-surface); font-size: 10px; font-weight: 700; }
+.nlk-mode-badge-agent { color: var(--nlk-accent); border-color: color-mix(in srgb,var(--nlk-accent) 45%,var(--nlk-border)); background: var(--nlk-accent-soft); }
+.nlk-agent-controls { margin-top: 14px; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 13px; }
+.nlk-range-row { display: grid; grid-template-columns: minmax(0,1fr) 68px; align-items: center; gap: 10px; min-height: 34px; }
+.nlk-range-row input[type="range"] { width: 100%; accent-color: var(--nlk-accent); }
+.nlk-number-input { text-align: center; font-weight: 800; }
+.nlk-input-suffix { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 7px; }
+.nlk-input-suffix > span { color: var(--nlk-muted); font-size: 10px; }
+.nlk-agent-safe { align-self: stretch; display: grid; place-items: center; padding: 12px; color: var(--nlk-muted); border: 1px dashed var(--nlk-border); border-radius: 9px; background: var(--nlk-surface); text-align: center; }
+.nlk-agent-save { justify-content: flex-end; margin: 11px 0 0; }
 .nlk-settings-fold { margin: 12px 0; padding: 11px 13px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
 .nlk-settings-fold > summary { color: var(--nlk-title); font-weight: 700; cursor: pointer; }
 .nlk-ai-helper { margin-bottom: 14px; padding: 14px; border: 1px solid color-mix(in srgb,var(--nlk-accent) 34%,var(--nlk-border)); border-radius: 13px; background: linear-gradient(125deg,var(--nlk-accent-soft),var(--nlk-surface)); }
@@ -24769,6 +25055,10 @@ const CSS = `
 .nlk-ai-prompt { min-height: 80px; }
 .nlk-ai-helper-foot { margin-top: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .nlk-ai-helper-foot span { color: var(--nlk-muted); font-size: 10px; }
+.nlk-ai-result { margin-top: 11px; padding: 10px 11px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb,#45b980 44%,var(--nlk-border)); border-radius: 9px; background: color-mix(in srgb,#45b980 9%,var(--nlk-surface)); }
+.nlk-ai-result strong, .nlk-ai-result small { display: block; }
+.nlk-ai-result small { margin-top: 2px; color: var(--nlk-muted); }
+.nlk-migration-ai { margin-top: 12px; }
 .nlk-lore-browser { margin: 10px 0; padding: 13px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
 .nlk-lore-browser > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .nlk-lore-browser > div:first-child strong, .nlk-lore-browser > div:first-child small { display: block; }
@@ -24805,6 +25095,10 @@ const CSS = `
 /* 所有主题的文字都从主题变量取色，避免酒馆全局 --white 等变量污染亮色模式。 */
 .nlk-root, .nlk-role-gate, .nlk-brand, .nlk-role-current, .nlk-nav-group, .nlk-sidebar-foot, .nlk-system-card, .nlk-check-explain { color: var(--nlk-text); }
 .nlk-shell strong, .nlk-shell h1, .nlk-shell h2, .nlk-shell h3, .nlk-shell summary { color: var(--nlk-title); }
+.nlk-shell .nlk-var-path, .nlk-shell .nlk-h3 { color: var(--nlk-title); }
+.nlk-shell .nlk-hint, .nlk-shell .nlk-statusbar, .nlk-shell .nlkaleido-workbench-status { color: var(--nlk-muted); opacity: 1; }
+.nlk-shell .nlk-statusbar, .nlk-shell .nlk-pre, .nlk-shell .nlk-contract-input { color: var(--nlk-text); border-color: var(--nlk-border); background: var(--nlk-input-bg); }
+.nlk-shell .nlk-var-row, .nlk-shell .nlk-log-row { border-color: var(--nlk-border); }
 .nlk-role-current { color: var(--nlk-text); border-color: var(--nlk-border); background: var(--nlk-accent-soft); }
 .nlk-brand-mark, .nlk-eyebrow, .nlk-role-card em { color: var(--nlk-accent); }
 .nlk-nav-group > small, .nlk-brand small, .nlk-system-card p, .nlk-check-explain small, .nlk-card-title small, .nlk-kpi span, .nlk-status-row span { color: var(--nlk-muted); opacity: 1; }
@@ -24813,6 +25107,9 @@ const CSS = `
 .nlk-theme-light .nlk-health { color: #176e49; background: #dff5e9; }
 .nlk-theme-light .nlk-toast-ok { color: #176e49; background: #e0f5e9; }
 .nlk-theme-light .nlk-toast-error, .nlk-theme-light .nlk-danger { color: #a92d41; }
+.nlk-theme-light { --nlk-muted: #536176; --nlk-border: rgba(45,59,84,.2); }
+.nlk-theme-light .nlk-achievement:not(.nlk-achievement-on) { opacity: .62; }
+.nlk-theme-light .nlk-role-current button, .nlk-theme-light .nlk-nav-icon { opacity: .82; }
 @media (max-width: 700px) {
   .nlkaleido-float-status { top: calc(100dvh - 48px); right: 8px; bottom: auto; }
   .nlkaleido-workbench { padding: 0; }
@@ -24839,6 +25136,12 @@ const CSS = `
   .nlk-model-form, .nlk-lore-entry { grid-template-columns: 1fr; }
   .nlk-dice-system-grid { grid-template-columns: 1fr; }
   .nlk-ai-helper-foot { align-items: stretch; flex-direction: column; }
+  .nlk-ai-result, .nlk-agent-budget-head { align-items: flex-start; grid-template-columns: auto 1fr; }
+  .nlk-ai-result { flex-direction: column; }
+  .nlk-ai-result .nlk-btn { width: 100%; }
+  .nlk-mode-badge { grid-column: 2; }
+  .nlk-agent-controls { grid-template-columns: 1fr; }
+  .nlk-model-picker { grid-template-columns: 1fr; }
 }
 `;
 /**
@@ -25065,7 +25368,7 @@ let adapter = null;
 let startupState = 'idle';
 let startupError = null;
 let previousChatId = null;
-const VERSION = '0.7.1';
+const VERSION = '0.8.0';
 /** 稳定 API 入口（每次取新鲜引用：chatMetadata 在切聊天后引用会变，文档警告不可长持） */
 function getStContext() {
     const globalObject = globalThis;

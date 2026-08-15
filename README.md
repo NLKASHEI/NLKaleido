@@ -21,8 +21,9 @@
 - **记忆（M13）**：作者端勾选启用 → 反思写入（同一变量请求）+ BM25 或可选向量检索 + L3 记忆段注入 + 遗忘状态机 + 记忆表。
 - **剧情（M15）**：契约声明 `plot: { enabled: true }` → 事件链状态机（本地骰子 + API 双驱）+ 风声系统 + 区域事件（面板「剧情」页签手动推进/停滞/终局）。
 - **检定（M16）**：契约声明 `dice: { enabled: true }` → roll/check/contest 检定引擎 + outcomes 结果分级 + AI 预设导入（tests 校验）+ 检定建议行（点击才执行，防奶人）。
-- **迁移（M9）**：面板「迁移」页签粘贴 MVU 老卡世界书条目与 ZOD 脚本 → 检测 → 解析 → 提取规则 → 生成契约初稿（难翻译构造显式标注，不静默丢弃）→ 导入。
-- **配置（M14）**：“模型与运行”页可复用酒馆当前模型，或填写独立 OpenAI-compatible 主 AI；另有可选向量模型。运行档位、连通测试、快照回滚和主题设置集中在此。
+- **AI 帮帮**：变量、世界书联动、检定、可选系统和 ZOD 迁移分别使用专用引导与硬约束；结果先载入可视化草稿并显示摘要，作者确认后才写入。
+- **迁移（M9）**：面板「迁移」页签粘贴 MVU 老卡世界书条目与 ZOD 脚本 → 本地确定性检测与提取 → 可选 AI 审校 → 生成契约初稿（难翻译构造显式标注，不静默丢弃）→ 人工确认导入。
+- **配置（M14）**：“模型与运行”页可复用酒馆当前模型，或填写独立 OpenAI-compatible 主 AI；支持经酒馆后端代理拉取模型并实际调用，另有可选向量模型。玩家可设置每轮请求上限：`1` 为传统单次更新，`2～8` 为带请求间隔保护的串行多步 Agent。
 
 主 AI 同时服务变量更新、世界推演、记忆整理和 AI 帮帮；可复用酒馆连接，也可独立配置 URL、模型与 Key。到期变量默认要求模型
 逐项给出“更新 / 不变”和依据，遗漏或结论与 patch 冲突会被拒绝并自动重试，避免 Agent 偷懒跳过。
@@ -71,6 +72,8 @@ const unsubscribe = window.NLKaleido.variables.subscribe((variables) => render(v
 并发写入按调用顺序串行保存；保存失败会拒绝 Promise 并恢复内存状态。底层
 `getState()` / `getContract()` / `dispatch()` 仅为内置管理界面和兼容用途保留。
 
+完整说明见 [`FRONTEND_API.md`](./FRONTEND_API.md)。
+
 事件（经 ST eventSource）：`nlkaleido:status_changed` / `nlkaleido:pending_updated` / `nlkaleido:contract_changed` / `nlkaleido:metrics` / `nlkaleido:run_changed` / `nlkaleido:achievement_unlocked` / `nlkaleido:memory_changed` / `nlkaleido:plot_changed` / `nlkaleido:dice_rolled` / `nlkaleido:config_changed`。
 
 ## 技术说明
@@ -87,7 +90,7 @@ const unsubscribe = window.NLKaleido.variables.subscribe((variables) => render(v
 
 ```bash
 npm install
-npm test        # 435 测试
+npm test        # 439 测试
 npm run build   # tsc → rollup → release/dist/（index.js + chunks/）
 ```
 

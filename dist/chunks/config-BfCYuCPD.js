@@ -16,7 +16,7 @@ const TIER_NAMES = Object.freeze({
     standard: '标准模式',
     advanced: '进阶模式',
 });
-const CONFIG_VERSION = 2;
+const CONFIG_VERSION = 3;
 /** 档位 → 默认配置（§20.13.4 表） */
 function tierDefaults(tier, storage) {
     const base = {
@@ -39,6 +39,9 @@ function tierDefaults(tier, storage) {
         },
         embeddingApi: {
             enabled: false, baseUrl: '', apiKey: '', model: '', dimensions: 1024,
+        },
+        agent: {
+            maxRequestsPerTurn: 1, minRequestIntervalMs: 1200,
         },
     };
     return base;
@@ -179,8 +182,16 @@ const migrateConfigV1ToV2 = (old) => ({
         enabled: false, baseUrl: '', apiKey: '', model: '', dimensions: 1024,
     },
 });
+/** v2 → v3：补充玩家可控的 Agent 请求预算；默认保持单次模式。 */
+const migrateConfigV2ToV3 = (old) => ({
+    ...old,
+    agent: {
+        maxRequestsPerTurn: 1,
+        minRequestIntervalMs: 1200,
+    },
+});
 /** 配置版本迁移：configVersion 落后 → 逐版本链式迁移（对齐 contractVersion 模式） */
-function migrateConfig(stored, migrations = [migrateConfigV1ToV2], targetVersion = CONFIG_VERSION) {
+function migrateConfig(stored, migrations = [migrateConfigV1ToV2, migrateConfigV2ToV3], targetVersion = CONFIG_VERSION) {
     if (!stored || typeof stored !== 'object')
         return { config: null, migrated: false, errors: ['配置缺失或损坏（恢复默认）'] };
     const record = { ...stored };
@@ -215,6 +226,7 @@ function migrateConfig(stored, migrations = [migrateConfigV1ToV2], targetVersion
             resources: { ...defaults.resources, ...(record.resources ?? {}) },
             primaryAi: { ...defaults.primaryAi, ...(record.primaryAi ?? {}) },
             embeddingApi: { ...defaults.embeddingApi, ...(record.embeddingApi ?? {}) },
+            agent: { ...defaults.agent, ...(record.agent ?? {}) },
         },
         migrated,
         errors,
@@ -234,6 +246,8 @@ const RESOURCE_LIMITS = Object.freeze({
     maxAtoms: 5000,
     maxMemoryTokens: 4000,
     maxTopK: 10,
+    maxRequestsPerTurn: 8,
+    maxRequestIntervalMs: 10_000,
 });
 /** 钳制配置到资源上限 */
 function clampConfig(config) {
@@ -253,6 +267,16 @@ function clampConfig(config) {
     if (config.memory.injectTopK > RESOURCE_LIMITS.maxTopK) {
         config.memory.injectTopK = RESOURCE_LIMITS.maxTopK;
         clamped.push(`注入条数超上限 → ${RESOURCE_LIMITS.maxTopK}`);
+    }
+    const requests = Math.max(1, Math.min(RESOURCE_LIMITS.maxRequestsPerTurn, Math.floor(config.agent.maxRequestsPerTurn || 1)));
+    if (requests !== config.agent.maxRequestsPerTurn) {
+        config.agent.maxRequestsPerTurn = requests;
+        clamped.push(`每轮 AI 请求数已限制为 ${requests}`);
+    }
+    const interval = Math.max(0, Math.min(RESOURCE_LIMITS.maxRequestIntervalMs, Math.floor(config.agent.minRequestIntervalMs || 0)));
+    if (interval !== config.agent.minRequestIntervalMs) {
+        config.agent.minRequestIntervalMs = interval;
+        clamped.push(`请求间隔已限制为 ${interval}ms`);
     }
     return { config, clamped };
 }
@@ -274,4 +298,4 @@ function dryRunConfig(candidate, env) {
     return { ok: errors.length === 0 || errors.every((e) => e.startsWith('资源钳制')), errors };
 }
 
-export { CONFIG_VERSION, RESOURCE_LIMITS, TIER_NAMES, applyOverrides, clampConfig, decideTier, dryRunConfig, isDestructiveAction, migrateConfig, migrateConfigV1ToV2, probeEnvironment, runSelfCheck, takeSnapshot, tierDefaults };
+export { CONFIG_VERSION, RESOURCE_LIMITS, TIER_NAMES, applyOverrides, clampConfig, decideTier, dryRunConfig, isDestructiveAction, migrateConfig, migrateConfigV1ToV2, migrateConfigV2ToV3, probeEnvironment, runSelfCheck, takeSnapshot, tierDefaults };
