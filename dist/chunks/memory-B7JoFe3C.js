@@ -68,6 +68,8 @@ const SEARCH_MIN_IMPORTANCE_DECAY = 0.15;
 const MAX_ENTITIES = 20;
 /** 候选置信度门控（§4.2 复用）：低于此值不写入 */
 const MEMORY_CONFIDENCE_GATE = 0.5;
+/** 单条长期记忆长度上限：原子事实要能独立理解，但不能退化成整段正文。 */
+const MAX_MEMORY_CONTENT_CHARS = 220;
 // ============================================================
 // §20.3 TTL / 衰减 / 遗忘状态机（纯函数，确定性）
 // ============================================================
@@ -404,17 +406,17 @@ function renderMemorySegment(store, query, options) {
 // §20.5 反思写入（变量通道 jsonSchema 追加字段；不新增请求）
 // ============================================================
 const ATOM_TYPES = ['episodic', 'factual', 'relational', 'preference', 'planned', 'unknown'];
-/** 反思 jsonSchema 片段（合并进 §10.2 变量请求 schema；可选字段，默认关闭） */
+/** 反思 jsonSchema 片段（合并进 §10.2 变量请求 schema；只在反思轮出现） */
 function buildReflectionSchema() {
     return {
         memory_candidates: {
             type: 'array',
-            description: '本轮对话中值得长期记住的新事实/事件/关系/偏好/计划（没有就省略或给空数组）',
+            description: '必须审查本轮剧情是否出现值得跨多轮保留的新事实。只记录正文明确发生的承诺、关系变化、计划、身份秘密、关键获得/失去或会影响后续的事件；禁止复制整段正文、对白、状态表、UI 文本和日常琐事，禁止推测、情绪化解读或补写未发生情节。没有合格事实时必须返回空数组。',
             maxItems: 8,
             items: {
                 type: 'object',
                 properties: {
-                    content: { type: 'string', description: '一句话记忆内容（主语明确、可脱离上下文理解）' },
+                    content: { type: 'string', minLength: 4, maxLength: MAX_MEMORY_CONTENT_CHARS, description: '一条独立事实，写清主体、发生了什么及明确结果；按剧情顺序客观表述，最多 220 字，不写总结升华。' },
                     type: { type: 'string', enum: [...ATOM_TYPES] },
                     importance: { type: 'number', minimum: 0, maximum: 1, description: '重要度 0-1' },
                     confidence: { type: 'number', minimum: 0, maximum: 1, description: '置信度 0-1' },
@@ -426,23 +428,32 @@ function buildReflectionSchema() {
         },
     };
 }
-/** 从变量请求响应中收集记忆候选（容错：非对象/缺 content 跳过；LLM 未给 type → classifyAtom） */
-function collectMemoryCandidates(parsed, context = {}) {
+/** 收集候选并保留拒绝原因，供面板回执解释“为什么没有写入”。 */
+function collectMemoryCandidatesWithReport(parsed, context = {}) {
+    const rejected = [];
     if (!parsed || typeof parsed !== 'object')
-        return [];
+        return { candidates: [], rejected };
     const raw = parsed.memory_candidates;
     if (!Array.isArray(raw))
-        return [];
-    const atoms = [];
+        return { candidates: [], rejected };
+    const candidates = [];
     for (const item of raw) {
-        if (!item || typeof item !== 'object')
+        if (!item || typeof item !== 'object') {
+            rejected.push({ content: '（无法读取的候选）', reason: '格式不是对象' });
             continue;
+        }
         const candidate = item;
         const content = typeof candidate.content === 'string' ? candidate.content.trim() : '';
-        if (!content)
+        if (!content) {
+            rejected.push({ content: '（空内容）', reason: '缺少可核对的事实内容' });
             continue;
+        }
+        if (content.length > MAX_MEMORY_CONTENT_CHARS) {
+            rejected.push({ content: content.slice(0, 80), reason: `超过 ${MAX_MEMORY_CONTENT_CHARS} 字，疑似复制正文而非原子事实` });
+            continue;
+        }
         const type = ATOM_TYPES.includes(candidate.type) ? candidate.type : classifyAtom(content);
-        atoms.push(makeAtom({
+        candidates.push(makeAtom({
             content,
             type,
             entities: Array.isArray(candidate.entities) ? candidate.entities.filter((e) => typeof e === 'string') : [],
@@ -454,7 +465,11 @@ function collectMemoryCandidates(parsed, context = {}) {
             createdAt: context.now,
         }));
     }
-    return atoms;
+    return { candidates, rejected };
+}
+/** 从变量请求响应中收集记忆候选；兼容旧调用，详细拒绝原因见 collectMemoryCandidatesWithReport。 */
+function collectMemoryCandidates(parsed, context = {}) {
+    return collectMemoryCandidatesWithReport(parsed, context).candidates;
 }
 /** 写入候选（去重 + 强化 + 置信度门控）；返回 {added, merged, dropped} */
 function writeMemoryCandidates(store, candidates, now) {
@@ -681,4 +696,4 @@ function bm25Retriever(id = 'builtin:retriever.bm25') {
     };
 }
 
-export { ARCHIVE_BATCH_SIZE, ARCHIVE_THRESHOLD, ATOM_TYPES, BASE_TTL_DAYS, BM25_B, BM25_K1, Bm25Index, DEFAULT_DECAY, FORGET_WINDOWS_MS, MAX_ENTITIES, MEMORY_CONFIDENCE_GATE, REFLECTION_EVERY_N_TURNS, REINFORCE_EMA, REINFORCE_JACCARD_THRESHOLD, REINFORCE_TTL_CAP, REINFORCE_TTL_STEP, RRF_K, SEARCH_MIN_IMPORTANCE_DECAY, advanceAtomStatus, bm25Retriever, buildEntityGraph, buildReflectionSchema, classifyAtom, collectMemoryCandidates, columnSemantics, commitArchive, computeDecayScore, computeTtl, createMemoryTable, hybridSearchMemory, isPurgeDue, maintainMemory, makeAtom, memorySearchScore, queryTable, reinforceAtom, renderMemorySegment, rrfFusion, searchMemory, selectArchiveBatch, snapshotByFloor, tokenJaccard, tokenize, upsertTableRow, writeMemoryCandidates };
+export { ARCHIVE_BATCH_SIZE, ARCHIVE_THRESHOLD, ATOM_TYPES, BASE_TTL_DAYS, BM25_B, BM25_K1, Bm25Index, DEFAULT_DECAY, FORGET_WINDOWS_MS, MAX_ENTITIES, MAX_MEMORY_CONTENT_CHARS, MEMORY_CONFIDENCE_GATE, REFLECTION_EVERY_N_TURNS, REINFORCE_EMA, REINFORCE_JACCARD_THRESHOLD, REINFORCE_TTL_CAP, REINFORCE_TTL_STEP, RRF_K, SEARCH_MIN_IMPORTANCE_DECAY, advanceAtomStatus, bm25Retriever, buildEntityGraph, buildReflectionSchema, classifyAtom, collectMemoryCandidates, collectMemoryCandidatesWithReport, columnSemantics, commitArchive, computeDecayScore, computeTtl, createMemoryTable, hybridSearchMemory, isPurgeDue, maintainMemory, makeAtom, memorySearchScore, queryTable, reinforceAtom, renderMemorySegment, rrfFusion, searchMemory, selectArchiveBatch, snapshotByFloor, tokenJaccard, tokenize, upsertTableRow, writeMemoryCandidates };

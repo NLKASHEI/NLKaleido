@@ -18,7 +18,7 @@
 - **玩家模式**：直接显示当前角色与世界状态，不暴露作者设置。
 - **作者模式**：使用带用途说明的向导定义变量、AI 更新方式、玩家显示、世界书联动和检定规则；列表、键值表、对象均可视化构造，复杂 JSON、变量预览与审计工具收在高级区。
   - **导出**：一键下载 `{contract, stat_data, changelog}` 打包 JSON。
-- **记忆（M13）**：普通/进阶档中由作者勾选启用 → 反思写入（单次模式合并在同一变量请求，不增加 RPM）+ BM25 或可选向量检索 + L3 记忆段注入 + 遗忘状态机 + 记忆表。极简档完整暂停记忆读写。
+- **记忆（M13）**：普通/进阶档中由作者勾选启用 → 反思写入（单次模式合并在同一请求，不增加 RPM）+ BM25 或可选向量检索 + L3 记忆段注入 + 遗忘状态机 + 记忆表。允许不设计任何变量，纯作记忆插件；极简档完整暂停记忆读写。
 - **剧情（M15）**：契约声明 `plot: { enabled: true }` → 事件链状态机（本地骰子 + API 双驱）+ 风声系统 + 区域事件（面板「剧情」页签手动推进/停滞/终局）。
 - **检定（M16）**：契约声明 `dice: { enabled: true }` → roll/check/contest 检定引擎 + outcomes 结果分级 + AI 预设导入（tests 校验）+ 检定建议行（点击才执行，防奶人）。
 - **AI 帮帮**：变量、世界书联动、检定、可选系统和 ZOD 迁移分别有独立问题表、专用后台提示与字段写入白名单；结果先载入可视化草稿并显示摘要，作者确认后才写入。
@@ -27,6 +27,8 @@
 
 主 AI 同时服务变量更新、世界推演、记忆整理和 AI 帮帮；可复用酒馆连接，也可独立配置 URL、模型与 Key。到期变量默认要求模型
 逐项给出“更新 / 不变”和依据，遗漏或结论与 patch 冲突会被拒绝并自动重试，避免 Agent 偷懒跳过。
+
+记忆页会显示整理周期、距离下次还有几轮、修改记录归档进度，以及每次新增、强化、拒绝或失败的可审计回执。后台 JSON、纪要和工具过程自动隐藏，不会插入聊天正文。长期记忆只接受正文明确发生的原子事实，拒绝整段正文、主观推测和超过 220 字的候选。
 
 ### 契约最小示例
 
@@ -74,7 +76,7 @@ const unsubscribe = window.NLKaleido.variables.subscribe((variables) => render(v
 
 完整说明见 [`FRONTEND_API.md`](./FRONTEND_API.md)。
 
-事件（经 ST eventSource）：`nlkaleido:status_changed` / `nlkaleido:pending_updated` / `nlkaleido:contract_changed` / `nlkaleido:metrics` / `nlkaleido:run_changed` / `nlkaleido:achievement_unlocked` / `nlkaleido:memory_changed` / `nlkaleido:plot_changed` / `nlkaleido:dice_rolled` / `nlkaleido:config_changed`。
+事件（经 ST eventSource）：`nlkaleido:status_changed` / `nlkaleido:pending_updated` / `nlkaleido:contract_changed` / `nlkaleido:metrics` / `nlkaleido:run_changed` / `nlkaleido:achievement_unlocked` / `nlkaleido:memory_changed` / `nlkaleido:activity_changed` / `nlkaleido:plot_changed` / `nlkaleido:dice_rolled` / `nlkaleido:config_changed`。
 
 ## 技术说明
 
@@ -90,7 +92,7 @@ const unsubscribe = window.NLKaleido.variables.subscribe((variables) => render(v
 
 ```bash
 npm install
-npm test        # 441 测试
+npm test        # 443 测试
 npm run build   # tsc → rollup → release/dist/（index.js + chunks/）
 ```
 

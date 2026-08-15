@@ -6167,7 +6167,7 @@ async function runSingleShotAgent(transport, opts) {
     };
     // 1. 本轮到期字段（agent 决策范围）
     const due = opts.runtime?.scheduler.due(state.meta, contract, turnId) ?? dueFields(state.meta, contract, turnId);
-    if (!due.length)
+    if (!due.length && !opts.forceRequest)
         return result;
     await opts.runtime?.run('message.received', contract, state, turnId, {
         recentStory: opts.recentStory ?? [], userInput: opts.userInput ?? '',
@@ -6275,6 +6275,9 @@ async function runSingleShotAgent(transport, opts) {
             continue;
         }
         if (!ops.length) {
+            // 纯记忆反思允许没有变量，也不要求模型伪造空变量更新；拿到结构化记忆结果即完成。
+            if (opts.forceRequest && requiredReviews.length === 0 && Array.isArray(response.payload?.memory_candidates))
+                break;
             // 覆盖全部必审变量并明确判断为 unchanged 时，这是有效的“本轮无变化”，不再逼模型乱改。
             if (requiredReviews.length > 0 && errors.length === 0)
                 break;
@@ -8372,6 +8375,7 @@ const SECTION_RULES = {
     systems: [
         '本次只负责可选能力：按需求设置 memory、plot、dice；没有明确需求的功能保持关闭，不得重做变量和 ejs。',
         '说明性内容必须落实为契约字段，不得只写建议；所有开启项都使用保守、低开销默认值。',
+        '如果作者明确要求“纯记忆插件/不要任何变量”，允许把 schema.properties、updateRules、displayRules 和 invariants 清空，只启用 memory；否则绝对不得删除已有变量。',
     ],
     migration: [
         '本次负责审校 MVU 迁移初稿：保留确定性迁移已经提取出的所有变量和规则，不得静默删除，也不得把 MVU 命令带入运行时。',
@@ -8383,7 +8387,7 @@ const SECTION_WRITE_SCOPE = {
     fields: '只允许修改 schema、updateRules、displayRules、invariants；ejs、memory、plot、dice、guardrails 和身份字段必须与当前契约逐字义等价。',
     ces: '只允许修改 ejs；确实缺少条件变量时才可最小新增 updateRules/displayRules，其他字段必须保持不变。',
     dice: '只允许修改 dice；其余全部字段必须保持不变。',
-    systems: '只允许修改 memory、plot、dice；其余全部字段必须保持不变。',
+    systems: '通常只允许修改 memory、plot、dice；只有作者明确要求纯记忆模式时，才允许清空变量相关的 schema.properties、updateRules、displayRules、invariants，其他字段仍须保持不变。',
     migration: '允许修复完整契约，但必须保留确定性迁移得到的全部变量、原规则证据和需人工确认标记。',
 };
 /**
@@ -8512,6 +8516,9 @@ class KaleidoStAdapter {
         memoryStore: { version: 1, atoms: [] },
         memoryTables: [],
         archiving: false,
+        activity: null,
+        activityHistory: [],
+        memoryReceipts: [],
         plotEvents: [],
         plotWinds: [],
         regionalIncident: { active: null, cooldown: 0 },
@@ -8553,7 +8560,7 @@ class KaleidoStAdapter {
     async ensureMemoryModule() {
         if (this.memoryModule)
             return this.memoryModule;
-        this.memoryModulePromise ??= import('./chunks/memory-ChxpNyeX.js');
+        this.memoryModulePromise ??= import('./chunks/memory-B7JoFe3C.js');
         this.memoryModule = await this.memoryModulePromise;
         return this.memoryModule;
     }
@@ -8986,6 +8993,8 @@ class KaleidoStAdapter {
         const memoryApi = memoryEnabled ? await this.ensureMemoryModule() : null;
         const reflectionEveryN = contract.memory?.reflectionEveryN ?? memoryApi?.REFLECTION_EVERY_N_TURNS ?? 10;
         const reflectionDue = memoryEnabled && turnId % reflectionEveryN === 0;
+        const variableCount = Object.keys(contract.updateRules).length;
+        const memoryOnly = memoryEnabled && variableCount === 0;
         const memoryQuery = memoryEnabled
             ? `${recentStory.map((m) => m.content).join('\n')}\n${userInput}`.slice(-4e3)
             : undefined;
@@ -9007,41 +9016,67 @@ class KaleidoStAdapter {
         // 作者契约仍负责变量规则与每步 token 护栏，但不可以强迫玩家承担额外 RPM。
         // ST 工具按回合注册，并由 finally 保证模型报错/切聊天/中止时也不会残留到正文生成。
         let result = null;
+        let multiStepResult = null;
         const configuredRequests = this.adapter.config.tier === 'minimal'
             ? 1
             : this.adapter.config.agent?.maxRequestsPerTurn ?? 1;
         const maxRequestsPerTurn = Math.max(1, Math.min(8, Math.floor(configuredRequests)));
-        if (maxRequestsPerTurn > 1) {
-            this.registerMultiStepTools();
-            try {
-                await this.requestMultiStepUpdate({
-                    maxSteps: maxRequestsPerTurn,
-                    minStepIntervalMs: Math.max(0, Math.min(10_000, this.adapter.config.agent?.minRequestIntervalMs ?? 1200)),
+        if (variableCount > 0) {
+            this.reportActivity({ system: 'variable', status: 'running', turnId, message: '正在检查并更新变量…' });
+        }
+        if (reflectionDue) {
+            this.reportActivity({ system: 'memory', status: 'running', turnId, message: memoryOnly ? '正在整理本轮长期记忆…' : '正在随变量请求整理长期记忆…' });
+        }
+        // 反思轮固定合并为一个结构化请求，保证记忆一定被显式审查且不突破玩家的请求预算。
+        try {
+            if (maxRequestsPerTurn > 1 && !reflectionDue && !memoryOnly) {
+                this.registerMultiStepTools();
+                try {
+                    multiStepResult = await this.requestMultiStepUpdate({
+                        maxSteps: maxRequestsPerTurn,
+                        minStepIntervalMs: Math.max(0, Math.min(10_000, this.adapter.config.agent?.minRequestIntervalMs ?? 1200)),
+                    });
+                }
+                finally {
+                    this.unregisterMultiStepTools();
+                }
+                this.reportActivity({
+                    system: 'variable',
+                    status: multiStepResult?.status === 'done' ? 'success' : 'warning',
+                    turnId,
+                    message: multiStepResult?.applied.length
+                        ? `变量多步检查完成：写入 ${multiStepResult.applied.length} 项`
+                        : `变量多步检查结束：${multiStepResult?.terminationReason ?? '没有写入变化'}`,
                 });
             }
-            finally {
-                this.unregisterMultiStepTools();
+            else {
+                result = await runSingleShotAgent(this, {
+                    contract,
+                    state,
+                    turnId,
+                    l0: memoryOnly
+                        ? `${l0 ?? ''}\n\n# 纯记忆模式\n本契约没有变量。不要编造变量、reviewed 或 json_patch；只按结构化 schema 客观审查本轮长期记忆候选。没有值得跨轮保留的事实时，memory_candidates 必须返回空数组。`
+                        : l0,
+                    recentStory,
+                    userInput,
+                    jsonSchema: this.buildJsonSchema(contract, { reflection: reflectionDue, memoryOnly }),
+                    memorySegment,
+                    plotSegment,
+                    plotStates,
+                    forceRequest: reflectionDue,
+                    runtime: {
+                        scheduler: this.extensions.resolve('scheduler'),
+                        cacheStrategy: this.extensions.resolve('cacheStrategy'),
+                        validator: this.extensions.resolve('validator'),
+                        run: (point, runtimeContract, runtimeState, runtimeTurnId, payload) => this.extensions.run(point, runtimeContract, runtimeState, runtimeTurnId, payload),
+                    },
+                });
             }
         }
-        else {
-            result = await runSingleShotAgent(this, {
-                contract,
-                state,
-                turnId,
-                l0,
-                recentStory,
-                userInput,
-                jsonSchema: this.buildJsonSchema(contract, { reflection: reflectionDue }),
-                memorySegment,
-                plotSegment,
-                plotStates,
-                runtime: {
-                    scheduler: this.extensions.resolve('scheduler'),
-                    cacheStrategy: this.extensions.resolve('cacheStrategy'),
-                    validator: this.extensions.resolve('validator'),
-                    run: (point, runtimeContract, runtimeState, runtimeTurnId, payload) => this.extensions.run(point, runtimeContract, runtimeState, runtimeTurnId, payload),
-                },
-            });
+        catch (error) {
+            const message = `${reflectionDue ? '记忆整理' : '变量更新'}失败：${error instanceof Error ? error.message : String(error)}`;
+            this.reportActivity({ system: reflectionDue ? 'memory' : 'variable', status: 'error', turnId, message });
+            throw error;
         }
         // generateRawData 是长异步边界。用户可能在等待期间切换聊天；旧 state 即使仍在内存中，
         // 也不得通过 getChatMetadata() 的新引用写入当前聊天。
@@ -9051,16 +9086,63 @@ class KaleidoStAdapter {
             await this.recomputeDerivedAndEffects(contract, state, turnId, {
                 recent_story: recentStory.map((m) => m.content).join('\n'), user_input: userInput, plot_states: plotStates ?? '',
             });
-            // §20.5：反思候选写入（合并进同一请求的 memory_candidates，不新增请求；失败静默不阻塞变量链路）
-            if (memoryEnabled && result.payload) {
-                const written = memoryApi.writeMemoryCandidates(memoryStore, memoryApi.collectMemoryCandidates(result.payload, { scope: 'chat', turnId, floorId: this.currentFloorId() }), Date.now());
-                if (written.added.length || written.merged.length) {
-                    this.enforceMaxAtoms(contract);
-                    this.onMemoryChanged?.();
-                }
+            if (variableCount > 0) {
+                const changed = result.applied.length;
+                const rejected = result.rejected.length + result.pending.length;
+                this.reportActivity({
+                    system: 'variable',
+                    status: rejected ? 'warning' : 'success',
+                    turnId,
+                    message: changed ? `变量已更新：写入 ${changed} 项${rejected ? `，${rejected} 项待复核` : ''}` : (rejected ? `变量检查完成：${rejected} 项需要复核` : '变量已检查：本轮没有变化'),
+                });
             }
-            await this.persistState(state, sessionKey);
+            // §20.5：反思候选写入（同一请求、零额外 RPM），并生成可审计回执。
+            if (reflectionDue && memoryEnabled && result.payload && Array.isArray(result.payload.memory_candidates)) {
+                const collected = memoryApi.collectMemoryCandidatesWithReport(result.payload, { scope: 'chat', turnId, floorId: this.currentFloorId() });
+                const written = memoryApi.writeMemoryCandidates(memoryStore, collected.candidates, Date.now());
+                this.enforceMaxAtoms(contract);
+                const rejected = [
+                    ...collected.rejected.map((item) => ({ content: item.content, reason: item.reason })),
+                    ...written.dropped.map((atom) => ({ id: atom.id, content: atom.content, type: atom.type, reason: '置信度不足，未达到写入门槛' })),
+                ];
+                const nextTurn = turnId + reflectionEveryN;
+                const status = written.added.length ? 'written' : written.merged.length ? 'reinforced' : 'no_change';
+                const message = written.added.length
+                    ? `记忆整理完成：新增 ${written.added.length} 条${written.merged.length ? `，强化 ${written.merged.length} 条` : ''}`
+                    : written.merged.length
+                        ? `记忆整理完成：强化 ${written.merged.length} 条，没有重复新增`
+                        : rejected.length
+                            ? `记忆已检查：${rejected.length} 条候选未通过，未写入`
+                            : '记忆已检查：本轮没有值得长期保存的新事实';
+                this.addMemoryReceipt({
+                    turnId, kind: 'reflection', status, mode: memoryOnly ? 'memory_only' : 'variables_and_memory',
+                    interval: reflectionEveryN, nextTurn,
+                    added: written.added.map((atom) => ({ id: atom.id, content: atom.content, type: atom.type })),
+                    reinforced: written.merged.map((atom) => ({ id: atom.id, content: atom.content, type: atom.type })),
+                    rejected,
+                    message,
+                });
+                this.reportActivity({ system: 'memory', status: 'success', turnId, message });
+            }
+            else if (reflectionDue && memoryEnabled) {
+                const message = '记忆整理未完成：本轮模型没有返回可读取的结构化结果';
+                this.addMemoryReceipt({
+                    turnId, kind: 'reflection', status: 'failed', mode: memoryOnly ? 'memory_only' : 'variables_and_memory',
+                    interval: reflectionEveryN, nextTurn: turnId + reflectionEveryN,
+                    added: [], reinforced: [], rejected: [], message,
+                });
+                this.reportActivity({ system: 'memory', status: 'error', turnId, message });
+            }
         }
+        if (variableCount > 0 && !multiStepResult && !result?.requested) {
+            this.reportActivity({ system: 'variable', status: 'info', turnId, message: '变量调度已检查：本轮没有到期项目' });
+        }
+        // 真正的空契约保持零写入；纯记忆契约则继续计轮并持久化。
+        if (variableCount === 0 && !memoryEnabled && !plotEnabled)
+            return;
+        // 对话轮次与“变量是否发生变化”解耦。否则连续无变化时反思轮永远不会到达，纯记忆模式也无法计数。
+        state.meta.lastTurnId = Math.max(state.meta.lastTurnId, turnId);
+        await this.persistState(state, sessionKey);
         // §20.3 衰减调度（Scheduler 语义；每轮本地推进，零模型成本）+ §20.5 远记忆归档（异步不阻塞）
         if (memoryEnabled) {
             const maintenance = memoryApi.maintainMemory(memoryStore, Date.now());
@@ -9111,11 +9193,34 @@ class KaleidoStAdapter {
     onAchievementUnlocked;
     /** @since M13 记忆变化回调（bridge 注入：nlkaleido:memory_changed，§20.10 面板刷新） */
     onMemoryChanged;
+    /** 变量、记忆和归档的可见阶段提示。 */
+    onActivityChanged;
     /** @since M15 剧情变化回调（bridge 注入：nlkaleido:plot_changed，§22.6 面板刷新） */
     onPlotChanged;
     /** 持久化/请求等运行时错误，供面板显示可见错误而不是静默吞掉。 */
     onRuntimeError;
     onEjsChanged;
+    reportActivity(input) {
+        const activity = {
+            ...input,
+            id: hash64(`${input.system}|${input.status}|${input.turnId}|${input.message}|${Date.now()}`),
+            at: Date.now(),
+        };
+        this.adapter.activity = activity;
+        this.adapter.activityHistory = [...this.adapter.activityHistory, activity].slice(-30);
+        this.onActivityChanged?.();
+        return activity;
+    }
+    addMemoryReceipt(receipt) {
+        const created = {
+            ...receipt,
+            id: hash64(`${receipt.kind}|${receipt.turnId}|${receipt.message}|${Date.now()}`),
+            at: Date.now(),
+        };
+        this.adapter.memoryReceipts = [...this.adapter.memoryReceipts, created].slice(-30);
+        this.onMemoryChanged?.();
+        return created;
+    }
     /**
      * 在正文生成开始前完成 CES 本地判定、世界书读取与 ST IN_CHAT 注入。
      * 这才是会影响正文的生产链路；变量更新请求里的 activeEntries 只是辅助上下文。
@@ -9701,7 +9806,7 @@ class KaleidoStAdapter {
      * → 独立总结请求 → 成功才删除原批 + 写长期摘要原子；失败整批保留、下轮重试。
      * 异步 fire-and-forget：绝不拉长变量链路。
      */
-    async archiveChangelog(contract) {
+    async archiveChangelog(contract, notifyIfIdle = false) {
         if (this.adapter.archiving || !this.adapter.state)
             return;
         const { state } = this.adapter;
@@ -9710,9 +9815,14 @@ class KaleidoStAdapter {
         const threshold = contract.memory?.archiveThreshold ?? memoryApi.ARCHIVE_THRESHOLD;
         const batchSize = contract.memory?.archiveBatchSize ?? memoryApi.ARCHIVE_BATCH_SIZE;
         const selection = memoryApi.selectArchiveBatch(state.changelog, threshold, batchSize);
-        if (!selection.triggered || !selection.batch.length)
+        if (!selection.triggered || !selection.batch.length) {
+            if (notifyIfIdle) {
+                this.reportActivity({ system: 'archive', status: 'info', turnId: state.meta.lastTurnId, message: `修改记录还未达到归档门槛：${state.changelog.length}/${threshold} 条` });
+            }
             return;
+        }
         this.adapter.archiving = true;
+        this.reportActivity({ system: 'archive', status: 'running', turnId: state.meta.lastTurnId, message: `正在归档最早的 ${selection.batch.length} 条修改记录…` });
         try {
             const summary = await this.summarizeArchiveBatch(selection.batch);
             if (!this.isSessionCurrent(sessionKey, state))
@@ -9729,13 +9839,26 @@ class KaleidoStAdapter {
                     turnId: state.meta.lastTurnId,
                 }));
                 this.enforceMaxAtoms(contract);
+                const interval = contract.memory?.reflectionEveryN ?? memoryApi.REFLECTION_EVERY_N_TURNS;
+                const message = `修改记录已归档：压缩 ${selection.batch.length} 条，原记录已在成功后移除`;
+                this.addMemoryReceipt({
+                    turnId: state.meta.lastTurnId, kind: 'archive', status: 'written',
+                    mode: Object.keys(contract.updateRules).length ? 'variables_and_memory' : 'memory_only',
+                    interval, nextTurn: state.meta.lastTurnId + (interval - (state.meta.lastTurnId % interval)),
+                    added: [{ content: `[归档] ${summary}`, type: 'factual' }], reinforced: [], rejected: [], message,
+                });
                 await this.persistState(state, sessionKey);
-                this.onMemoryChanged?.();
+                this.reportActivity({ system: 'archive', status: 'success', turnId: state.meta.lastTurnId, message });
+            }
+            else {
+                const message = '记忆归档失败：模型没有返回可用摘要；原修改记录已保留，下轮会重试';
+                this.reportActivity({ system: 'archive', status: 'warning', turnId: state.meta.lastTurnId, message });
             }
             // 失败（summary 空）→ 原批保留，下轮重试（§20.5 整批成功才删）
         }
         catch (error) {
             console.warn('[NLKaleido] 记忆归档失败（保留原日志，下轮重试）：', error);
+            this.reportActivity({ system: 'archive', status: 'error', turnId: state.meta.lastTurnId, message: `记忆归档失败：${error instanceof Error ? error.message : String(error)}；原记录已保留` });
         }
         finally {
             this.adapter.archiving = false;
@@ -9744,9 +9867,23 @@ class KaleidoStAdapter {
     /** 归档总结请求（独立请求，不阻塞变量链路；失败返回 null） */
     async summarizeArchiveBatch(batch) {
         try {
-            const lines = batch.map((entry) => `- 第${entry.turnId}轮 ${entry.path}${entry.source ? `（${entry.source}）` : ''}`).join('\n');
+            const lines = batch.map((entry) => JSON.stringify({
+                turn: entry.turnId,
+                path: entry.path,
+                before: entry.old,
+                after: entry.new,
+                rationale: entry.rationale,
+                source: entry.source,
+            })).join('\n');
             const data = await this.generateAiData([
-                { role: 'system', content: `你是长期记忆归档器。把下列变量变更事件压缩成 1-2 句长期摘要（中文，主语明确、可脱离上下文理解）。只输出摘要本身，不要 JSON、不要标签。\n${lines}` },
+                { role: 'system', content: [
+                        '你是长期记忆归档器。请把下列已经提交成功的变量变更压缩成 1-3 句中文事实记录。',
+                        '硬性要求：按轮次顺序；主体明确；保留关键人物、事件结果以及原记录明确给出的因果；只写已经发生的事实。',
+                        '禁止推测、情绪化解读、主观评价、虚构地点/时间/动机，也不要写总结升华。',
+                        '相同事实合并，互相冲突时以更晚轮次为准；输出最多 300 字，只输出摘要本身，不要 JSON、标签或思维过程。',
+                        '待归档记录（JSONL）：',
+                        lines,
+                    ].join('\n') },
             ]);
             const summary = data?.choices?.[0]?.message?.content?.trim() ?? '';
             return summary || null;
@@ -9815,13 +9952,18 @@ class KaleidoStAdapter {
                 throw new Error('记忆反思 schema 请求早于记忆模块加载');
             Object.assign(properties, this.memoryModule.buildReflectionSchema());
         }
+        const required = options.memoryOnly
+            ? ['analysis', 'memory_candidates']
+            : ['analysis', 'reviewed', 'json_patch', ...(options.reflection ? ['memory_candidates'] : [])];
         return {
             name: 'nlkaleido_variable_update',
-            description: '变量状态更新：必须逐项 reviewed，再返回必要的 json_patch',
+            description: options.memoryOnly
+                ? '纯记忆整理：客观审查本轮明确发生的事实；没有长期价值时返回空 memory_candidates'
+                : '变量状态更新：必须逐项 reviewed，再返回必要的 json_patch；反思轮必须显式返回 memory_candidates（允许空数组）',
             value: {
                 type: 'object',
                 properties,
-                required: ['analysis', 'reviewed', 'json_patch'],
+                required,
             },
         };
     }
@@ -10137,7 +10279,7 @@ class KaleidoStAdapter {
     }
     /** §20.9 memory_memorize：主动写入长期记忆（classifyAtom 兜底分类 + 置信度门控） */
     async toolMemoryMemorize(args) {
-        const { makeAtom, writeMemoryCandidates } = await import('./chunks/memory-ChxpNyeX.js');
+        const { makeAtom, writeMemoryCandidates } = await import('./chunks/memory-B7JoFe3C.js');
         const content = String(args?.content ?? '').trim();
         if (!content)
             return { ok: false, error: '缺少 content' };
@@ -10274,7 +10416,7 @@ class KaleidoStAdapter {
                     await storageProvider.save(STORE_KEY_CHAT, chatState, storageMeta);
                     const memoryEnabled = contract?.memory?.enabled === true;
                     if (memoryEnabled || this.adapter.memoryStore.atoms.length || this.adapter.memoryTables.length) {
-                        await storageProvider.save(STORE_KEY_CHAT_MEMORY, { store: this.adapter.memoryStore, tables: this.adapter.memoryTables }, storageMeta);
+                        await storageProvider.save(STORE_KEY_CHAT_MEMORY, { store: this.adapter.memoryStore, tables: this.adapter.memoryTables, receipts: this.adapter.memoryReceipts }, storageMeta);
                     }
                     if (contract) {
                         await storageProvider.save(`${STORE_KEY_GLOBAL_PREFIX}${contract.id}`, layers.run, storageMeta);
@@ -10293,7 +10435,7 @@ class KaleidoStAdapter {
                 // §20.10：记忆与变量共用存储体系（chat 层持久化；默认关闭 → 空库不写）
                 const memoryEnabled = contract?.memory?.enabled === true;
                 if (memoryEnabled || this.adapter.memoryStore.atoms.length || this.adapter.memoryTables.length) {
-                    meta.variables[STORE_KEY_CHAT_MEMORY] = { store: this.adapter.memoryStore, tables: this.adapter.memoryTables };
+                    meta.variables[STORE_KEY_CHAT_MEMORY] = { store: this.adapter.memoryStore, tables: this.adapter.memoryTables, receipts: this.adapter.memoryReceipts };
                 }
                 this.globals.setChatMetadata(meta);
                 await this.globals.saveChat(); // U2 补充：真实落盘完成后 commit 才算成功
@@ -10342,7 +10484,7 @@ class KaleidoStAdapter {
             ? stored
             : null;
     }
-    /** @since M13 加载记忆持久化（chat 层 blob：{store, tables}；缺省返回空库） */
+    /** @since M13 加载记忆持久化（chat 层 blob：{store, tables, receipts}；缺省返回空库） */
     loadMemoryStore() {
         const meta = this.globals.getChatMetadata();
         const stored = meta.variables?.[STORE_KEY_CHAT_MEMORY];
@@ -10350,9 +10492,11 @@ class KaleidoStAdapter {
             ? { version: 1, atoms: stored.store.atoms }
             : { version: 1, atoms: [] };
         const tables = Array.isArray(stored?.tables) ? stored.tables.map((t) => ({ ...t, rows: [...(t.rows ?? [])] })) : [];
+        const receipts = Array.isArray(stored?.receipts) ? stored.receipts.slice(-30) : [];
         this.adapter.memoryStore = store;
         this.adapter.memoryTables = tables;
-        return { store, tables };
+        this.adapter.memoryReceipts = receipts;
+        return { store, tables, receipts };
     }
     /** @since M13 契约记忆表水合（§20.7：契约声明列结构 + 存量行合并；缺列补齐） */
     async hydrateMemoryTables(contract) {
@@ -10492,6 +10636,7 @@ const NL_EVENTS = Object.freeze({
     RUN_CHANGED: 'nlkaleido:run_changed',
     ACHIEVEMENT_UNLOCKED: 'nlkaleido:achievement_unlocked',
     MEMORY_CHANGED: 'nlkaleido:memory_changed',
+    ACTIVITY_CHANGED: 'nlkaleido:activity_changed',
     PLOT_CHANGED: 'nlkaleido:plot_changed',
     DICE_ROLLED: 'nlkaleido:dice_rolled',
     CONFIG_CHANGED: 'nlkaleido:config_changed',
@@ -10534,7 +10679,11 @@ class KaleidoStateBridge {
         this.emit(NL_EVENTS.MEMORY_CHANGED, {
             atoms: this.adapter.adapter.memoryStore.atoms.length,
             tables: this.adapter.adapter.memoryTables.length,
+            receipts: this.adapter.adapter.memoryReceipts.length,
         });
+    }
+    notifyActivityChanged() {
+        this.emit(NL_EVENTS.ACTIVITY_CHANGED, this.adapter.adapter.activity);
     }
     /** @since M15 剧情变化（面板 nlkaleido:plot_changed 刷新，§22.6） */
     notifyPlotChanged() {
@@ -10800,7 +10949,7 @@ class KaleidoStateBridge {
                 const contract = this.adapter.adapter.contract;
                 if (!contract)
                     return { ok: false, error: '契约未加载' };
-                void this.adapter.archiveChangelog(contract);
+                void this.adapter.archiveChangelog(contract, true);
                 return { ok: true };
             }
             case 'memorySearch': {
@@ -23479,6 +23628,9 @@ const useNlStore = defineStore('nlkaleido:panel', () => {
     /** @since M14 配置刷新计数（nlkaleido:config_changed → +1 触发重渲染） */
     const configVersionCount = ref(0);
     const runtimeMessage = ref('');
+    const activityVersion = ref(0);
+    const activityMessage = ref('');
+    const activityStatus = ref('info');
     const setTheme = (next) => {
         theme.value = next;
         try {
@@ -23486,7 +23638,7 @@ const useNlStore = defineStore('nlkaleido:panel', () => {
         }
         catch { /* 不阻塞界面 */ }
     };
-    return { compat, statData, pending, changelog, lastTurnId, authorMode, roleMode, theme, setTheme, authorSection, contractText, contractError, activeTab, memoryVersion, plotVersion, diceVersion, configVersionCount, runtimeMessage };
+    return { compat, statData, pending, changelog, lastTurnId, authorMode, roleMode, theme, setTheme, authorSection, contractText, contractError, activeTab, memoryVersion, plotVersion, diceVersion, configVersionCount, runtimeMessage, activityVersion, activityMessage, activityStatus };
 });
 function json(value) {
     return JSON.stringify(value, null, 2);
@@ -23749,8 +23901,8 @@ const ContractEditor = defineComponent({
             },
             systems: {
                 title: 'AI 帮帮 · 其他能力',
-                desc: '只判断是否需要长期记忆、世界推演或检定；没有明确用途就保持关闭。',
-                quick: ['只开长期记忆', '只开世界推演与风声', '给复杂长篇卡做保守组合'],
+                desc: '可设计长期记忆、纯记忆插件、世界推演或检定；没有明确用途就保持关闭。',
+                quick: ['做成纯记忆插件，不要任何变量', '保留变量，只开长期记忆', '只开世界推演与风声'],
                 questions: [
                     { label: '希望系统额外做什么', help: '写实际需求，不必先决定功能名。', placeholder: '例：记住长期约定，并让聊天外的势力每 5 轮推进一次。' },
                     { label: '这张卡大概怎么玩', help: '说明短篇/长篇、人物数量和世界变化复杂度。', placeholder: '例：长篇群像，多个势力会在玩家看不到的地方行动。' },
@@ -24003,6 +24155,9 @@ const ContractEditor = defineComponent({
             }
             else if (section.value === 'systems') {
                 const optionalAvailable = adapter.adapter.config.tier !== 'minimal';
+                const memory = contract.memory ?? { enabled: false, reflectionEveryN: 10, maxAtoms: 500, archiveThreshold: 50, archiveBatchSize: 3 };
+                const patchMemory = (patch) => { contract.memory = { ...memory, ...patch }; changed(); };
+                const variableCount = Object.keys(contract.updateRules).length;
                 const systemCard = (name, desc, enabled, toggle, locked = false) => h('article', { class: enabled && !locked ? 'nlk-system-card nlk-system-on' : locked ? 'nlk-system-card nlk-system-locked' : 'nlk-system-card' }, [
                     h('div', null, [h('strong', null, name), h('p', null, desc), locked ? h('small', { class: 'nlk-system-lock-note' }, enabled ? '契约已配置，但极简档会暂停运行；切到普通档即可恢复。' : '普通档或进阶档可开启。') : null]), h('label', { class: 'nlk-switch' }, [h('input', { type: 'checkbox', checked: enabled, disabled: locked, onChange: (e) => toggle(e.target.checked) }), h('span')]),
                 ]);
@@ -24011,6 +24166,16 @@ const ContractEditor = defineComponent({
                         ? h('div', { class: 'nlk-callout' }, '勾选需要的功能后，点击页面右上角“检查并保存”才会生效。关闭的功能不会加载对应数据和计算。')
                         : h('div', { class: 'nlk-callout nlk-callout-warn nlk-tier-lock-callout' }, [h('span', null, '当前是极简档：只进行传统单次变量更新，记忆和世界推演不会加载、写入或额外请求。'), h('button', { class: 'nlk-btn', onClick: () => { store.activeTab = 'config'; } }, '切换到普通档')]),
                     systemCard('长期记忆', '单次模式也能写入：到反思轮时，记忆候选与变量更新由同一个请求返回，不会额外占用 RPM。', contract.memory?.enabled === true, (on) => toggleSystem('memory', on), !optionalAvailable),
+                    contract.memory?.enabled ? h('article', { class: 'nlk-card nlk-memory-config-card' }, [
+                        h('div', { class: 'nlk-pane-title' }, [h('div', null, [h('strong', null, variableCount ? '记忆整理节奏' : '纯记忆模式已启用'), h('small', null, variableCount ? '变量与记忆共用反思轮请求。' : '这张卡不需要任何变量；系统只在后台整理和召回记忆。')]), h('span', { class: 'nlk-type-badge' }, variableCount ? `${variableCount} 个变量` : '0 变量')]),
+                        h('div', { class: 'nlk-form-grid' }, [
+                            input('每隔几轮整理一次长期记忆', memory.reflectionEveryN ?? 10, (value) => patchMemory({ reflectionEveryN: Math.max(1, Math.min(100, Number(value) || 10)) }), { type: 'number', min: 1, max: 100 }, '例如 10：第 10、20、30 轮整理。单次模式会合并进当轮请求，不额外增加 RPM。'),
+                            input('修改记录累计多少条后归档', memory.archiveThreshold ?? 50, (value) => patchMemory({ archiveThreshold: Math.max(5, Math.min(500, Number(value) || 50)) }), { type: 'number', min: 5, max: 500 }, variableCount ? '只针对变量修改记录。达到门槛后后台压缩，成功后才删除原记录。' : '纯记忆模式没有变量修改记录，这项不会触发，可以保持默认。'),
+                            input('一次归档多少条', memory.archiveBatchSize ?? 3, (value) => patchMemory({ archiveBatchSize: Math.max(1, Math.min(30, Number(value) || 3)) }), { type: 'number', min: 1, max: 30 }, '批次越小越稳，默认 3 条。失败时整批保留，下轮重试。'),
+                            input('最多保存多少条记忆', memory.maxAtoms ?? 500, (value) => patchMemory({ maxAtoms: Math.max(20, Math.min(5000, Number(value) || 500)) }), { type: 'number', min: 20, max: 5000 }, '超出后优先保留重要、近期且被多次强化的内容。'),
+                        ]),
+                        h('div', { class: 'nlk-callout' }, '整理结果自动隐藏在聊天正文之外，不会把 JSON、纪要或工具过程发给玩家；但每次新增、强化、拒绝和失败都会在“记忆数据”留下回执。'),
+                    ]) : null,
                     systemCard('世界推演', '让聊天外的事件继续发展，并把玩家可能听到的消息带回剧情；按作者设定的轮次节流。', contract.plot?.enabled === true, (on) => toggleSystem('plot', on), !optionalAvailable),
                     h('article', { class: 'nlk-card' }, [h('div', { class: 'nlk-pane-title' }, '变量 AI 预算'), h('div', { class: 'nlk-callout' }, '每轮调用 1 次还是进入多步工具循环，由玩家在“运行设置”控制；作者这里只限制每一步能使用的输出预算。'), h('div', { class: 'nlk-form-grid' }, [
                             input('每一步最多输出多少 token', contract.guardrails.maxTokensPerStep, (value) => { contract.guardrails.maxTokensPerStep = Math.max(128, Number(value) || 2048); changed(); }, { type: 'number', min: 128, max: 8192 }, '普通卡保持 2048 即可。它限制单次输出长度，不会增加请求次数。'),
@@ -24167,6 +24332,17 @@ const MemoryView = defineComponent({
             }
             const allAtoms = atoms();
             const activeCount = allAtoms.filter((atom) => atom.status === 'active').length;
+            void store.activityVersion;
+            const contract = adapter.adapter.contract;
+            const interval = contract.memory?.reflectionEveryN ?? 10;
+            const currentTurn = adapter.adapter.state?.meta.lastTurnId ?? 0;
+            const nextReflectionTurn = (Math.floor(currentTurn / interval) + 1) * interval;
+            const turnsRemaining = Math.max(0, nextReflectionTurn - currentTurn);
+            const archiveThreshold = contract.memory?.archiveThreshold ?? 50;
+            const archiveCount = adapter.adapter.state?.changelog.length ?? 0;
+            const memoryOnly = Object.keys(contract.updateRules).length === 0;
+            const activity = adapter.adapter.activity?.system === 'memory' || adapter.adapter.activity?.system === 'archive' ? adapter.adapter.activity : null;
+            const receipts = adapter.adapter.memoryReceipts.slice().reverse();
             const visible = allAtoms
                 .filter((atom) => typeFilter.value === 'all' || atom.type === typeFilter.value)
                 .filter((atom) => statusFilter.value === 'all' || atom.status === statusFilter.value)
@@ -24180,7 +24356,18 @@ const MemoryView = defineComponent({
                 { key: 'global', name: '跨聊天', desc: '跨聊天与角色卡共享的长期事实' },
             ];
             return h('div', { class: 'nlk-section' }, [
-                h('section', { class: 'nlk-page-head nlk-memory-head' }, [h('div', null, [h('div', { class: 'nlk-eyebrow' }, '记忆库'), h('h2', null, '这张卡记住了什么'), h('p', null, '按作用域整理、搜索和维护记忆。单次模式会把反思候选合并进变量请求，不会额外调用模型。')]), h('button', { class: 'nlk-btn', onClick: archiveNow }, '从修改记录归档')]),
+                h('section', { class: 'nlk-page-head nlk-memory-head' }, [h('div', null, [h('div', { class: 'nlk-eyebrow' }, memoryOnly ? '纯记忆插件' : '记忆库'), h('h2', null, '这张卡记住了什么'), h('p', null, memoryOnly ? '没有变量也可以独立工作：按设定轮次在后台整理事实，并在相关剧情中自动召回。' : '按作用域整理、搜索和维护记忆。单次模式会把反思候选合并进变量请求，不会额外调用模型。')]), h('button', { class: 'nlk-btn', onClick: archiveNow, disabled: memoryOnly }, memoryOnly ? '纯记忆模式无需归档' : '从修改记录归档')]),
+                h('section', { class: 'nlk-memory-observer' }, [
+                    h('div', { class: 'nlk-memory-observer-main' }, [
+                        h('div', { class: activity?.status === 'running' ? 'nlk-activity-dot nlk-activity-running' : 'nlk-activity-dot' }),
+                        h('div', null, [h('strong', null, activity?.message ?? `距离下次长期记忆整理还有 ${turnsRemaining} 轮`), h('small', null, `当前第 ${currentTurn} 轮 · 每 ${interval} 轮整理 · 下次第 ${nextReflectionTurn} 轮`)]),
+                    ]),
+                    h('div', { class: 'nlk-memory-schedule' }, [
+                        h('span', null, '整理进度'),
+                        h('div', { class: 'nlk-memory-meter' }, h('span', { style: `width:${Math.max(4, Math.min(100, ((interval - turnsRemaining) / interval) * 100))}%` })),
+                    ]),
+                    h('div', { class: 'nlk-memory-archive-progress' }, [h('strong', null, memoryOnly ? '后台自动隐藏' : `${archiveCount}/${archiveThreshold}`), h('small', null, memoryOnly ? '整理输出不进入聊天正文，回执仍可查。' : '修改记录归档进度；未达门槛不调用 AI。')]),
+                ]),
                 h('div', { class: 'nlk-memory-stats' }, [
                     h('div', { class: 'nlk-memory-stat' }, [h('strong', null, String(allAtoms.length)), h('span', null, '全部记忆')]),
                     h('div', { class: 'nlk-memory-stat' }, [h('strong', null, String(activeCount)), h('span', null, '正在使用')]),
@@ -24191,6 +24378,16 @@ const MemoryView = defineComponent({
                     h('button', { class: memoryView.value === 'atoms' ? 'nlk-memory-tab nlk-memory-tab-active' : 'nlk-memory-tab', onClick: () => { memoryView.value = 'atoms'; } }, `记忆条目 ${allAtoms.length}`),
                     h('button', { class: memoryView.value === 'tables' ? 'nlk-memory-tab nlk-memory-tab-active' : 'nlk-memory-tab', onClick: () => { memoryView.value = 'tables'; } }, `结构化表 ${tables().length}`),
                 ]),
+                receipts.length ? h('details', { class: 'nlk-memory-receipts', open: receipts[0]?.status === 'failed' }, [
+                    h('summary', null, `整理回执（最近 ${receipts.length} 次）`),
+                    h('div', { class: 'nlk-receipt-list' }, receipts.slice(0, 12).map((receipt) => h('article', { class: `nlk-receipt nlk-receipt-${receipt.status}`, key: receipt.id }, [
+                        h('div', { class: 'nlk-receipt-head' }, [h('strong', null, receipt.kind === 'archive' ? `第 ${receipt.turnId} 轮 · 修改归档` : `第 ${receipt.turnId} 轮 · 长期记忆整理`), h('span', null, receipt.status === 'written' ? '已新增' : receipt.status === 'reinforced' ? '已强化' : receipt.status === 'failed' ? '失败' : '无变化')]),
+                        h('p', null, receipt.message),
+                        receipt.added.length ? h('div', { class: 'nlk-receipt-items' }, [h('b', null, '写入'), ...receipt.added.map((item) => h('span', null, item.content))]) : null,
+                        receipt.reinforced.length ? h('div', { class: 'nlk-receipt-items' }, [h('b', null, '强化'), ...receipt.reinforced.map((item) => h('span', null, item.content))]) : null,
+                        receipt.rejected.length ? h('div', { class: 'nlk-receipt-items nlk-receipt-rejected' }, [h('b', null, '未写入'), ...receipt.rejected.map((item) => h('span', null, `${item.content}${item.reason ? ` — ${item.reason}` : ''}`))]) : null,
+                    ]))),
+                ]) : h('div', { class: 'nlk-memory-receipt-empty' }, `还没有整理回执。第 ${nextReflectionTurn} 轮会第一次检查并明确告诉你写了什么。`),
                 memoryView.value === 'atoms' ? h('div', { class: 'nlk-memory-toolbar' }, [
                     h('input', { class: 'nlk-input nlk-memory-search', type: 'search', value: query.value, onInput: (event) => { query.value = event.target.value; }, placeholder: '搜索内容或人物…' }),
                     h('select', { class: 'nlk-input', value: typeFilter.value, onChange: (e) => { typeFilter.value = e.target.value; } }, [['all', '全部类型'], ...Object.entries(TYPE_NAMES)].map(([value, label]) => h('option', { value }, label))),
@@ -24904,6 +25101,7 @@ const PanelRoot = defineComponent({
                 ]),
                 h('main', { class: 'nlk-main' }, [
                     store.runtimeMessage ? h('div', { class: 'nlk-toast nlk-toast-error' }, [h('span', null, store.runtimeMessage), h('button', { class: 'nlk-icon-btn', onClick: () => { store.runtimeMessage = ''; } }, '×')]) : null,
+                    store.activityMessage ? h('div', { class: `nlk-toast nlk-toast-activity nlk-toast-${store.activityStatus}` }, [h('span', null, store.activityMessage), h('button', { class: 'nlk-icon-btn', onClick: () => { store.activityMessage = ''; } }, '×')]) : null,
                     page(),
                 ]),
             ])]);
@@ -25070,7 +25268,8 @@ const CSS = `
 .nlk-stack { display: flex; flex-direction: column; gap: 10px; } .nlk-callout { padding: 9px 11px; border-left: 2px solid #8870df; border-radius: 5px; background: rgba(126,98,224,.08); color: rgba(255,255,255,.7); } .nlk-callout-warn { border-color: #dca85c; background: rgba(220,168,92,.08); }
 .nlk-system-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 16px; border: 1px solid rgba(255,255,255,.08); border-radius: 11px; background: rgba(255,255,255,.025); } .nlk-system-card p { margin: 3px 0 0; color: var(--nlk-muted); } .nlk-system-on { border-color: rgba(120,213,169,.25); background: rgba(70,180,129,.055); }
 .nlk-switch input { width: 18px; height: 18px; accent-color: #866bea; } .nlk-row-tight { margin: 0; gap: 5px; }
-.nlk-toast { margin-bottom: 10px; padding: 9px 11px; border-radius: 8px; } .nlk-toast-ok { color: #8be5b6; background: rgba(68,185,125,.11); } .nlk-toast-error { color: #ff9ba5; background: rgba(220,72,91,.11); } .nlk-toast-info { color: #b8caff; background: rgba(82,118,210,.11); }
+.nlk-toast { margin-bottom: 10px; padding: 9px 11px; border-radius: 8px; } .nlk-toast-ok, .nlk-toast-success { color: #8be5b6; background: rgba(68,185,125,.11); } .nlk-toast-error { color: #ff9ba5; background: rgba(220,72,91,.11); } .nlk-toast-info, .nlk-toast-running { color: #b8caff; background: rgba(82,118,210,.11); } .nlk-toast-warning { color: #f0ca77; background: rgba(205,148,41,.12); }
+.nlk-toast-activity { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--nlk-border); }
 .nlk-technical { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 10px; } .nlk-technical > summary { color: var(--nlk-muted); cursor: pointer; }
 .nlkaleido-mount-error { padding: 16px; color: var(--red, #f66); white-space: pre-wrap; }
 .nlk-shell, .nlk-root, .nlk-role-gate { color: var(--nlk-text); background-color: var(--nlk-bg); }
@@ -25212,6 +25411,29 @@ const CSS = `
 .nlk-system-lock-note { display: block; margin-top: 4px; color: var(--nlk-muted); }
 .nlk-system-card:has(input:disabled) { border-style: dashed; }
 .nlk-memory-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; }
+.nlk-memory-config-card { display: grid; gap: 12px; }
+.nlk-memory-observer { margin-bottom: 11px; padding: 13px 15px; display: grid; grid-template-columns: minmax(220px,1fr) minmax(160px,.55fr) minmax(150px,.45fr); align-items: center; gap: 16px; border: 1px solid color-mix(in srgb,var(--nlk-accent) 30%,var(--nlk-border)); border-radius: 12px; background: linear-gradient(120deg,var(--nlk-accent-soft),var(--nlk-surface)); }
+.nlk-memory-observer-main { display: flex; align-items: center; gap: 10px; }
+.nlk-memory-observer-main strong, .nlk-memory-observer-main small, .nlk-memory-archive-progress strong, .nlk-memory-archive-progress small { display: block; }
+.nlk-memory-observer-main small, .nlk-memory-schedule, .nlk-memory-archive-progress small { color: var(--nlk-muted); }
+.nlk-activity-dot { width: 10px; height: 10px; flex: 0 0 auto; border-radius: 50%; background: #55bd8a; box-shadow: 0 0 0 4px color-mix(in srgb,#55bd8a 15%,transparent); }
+.nlk-activity-running { animation: nlk-pulse 1.2s ease-in-out infinite; }
+@keyframes nlk-pulse { 50% { opacity: .38; transform: scale(.8); } }
+.nlk-memory-schedule { display: grid; gap: 5px; }
+.nlk-memory-archive-progress { padding-left: 14px; border-left: 1px solid var(--nlk-border); }
+.nlk-memory-receipts { margin: 11px 0; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
+.nlk-memory-receipts > summary { padding: 10px 13px; color: var(--nlk-title); cursor: pointer; font-weight: 700; }
+.nlk-receipt-list { display: grid; border-top: 1px solid var(--nlk-border); }
+.nlk-receipt { padding: 11px 13px; border-top: 1px solid var(--nlk-border); }
+.nlk-receipt:first-child { border-top: 0; }
+.nlk-receipt-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.nlk-receipt-head span { color: var(--nlk-muted); font-size: 10px; }
+.nlk-receipt p { margin: 4px 0; color: var(--nlk-muted); }
+.nlk-receipt-items { margin-top: 6px; display: grid; grid-template-columns: 54px minmax(0,1fr); gap: 3px 9px; }
+.nlk-receipt-items b { grid-row: 1 / span 99; color: #47a878; }
+.nlk-receipt-items span { overflow-wrap: anywhere; }
+.nlk-receipt-rejected b { color: #c58a35; }
+.nlk-memory-receipt-empty { margin: 11px 0; padding: 12px; color: var(--nlk-muted); border: 1px dashed var(--nlk-border); border-radius: 10px; text-align: center; }
 .nlk-memory-stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; margin-bottom: 13px; }
 .nlk-memory-stat { padding: 12px 14px; border: 1px solid var(--nlk-border); border-radius: 11px; background: var(--nlk-surface); }
 .nlk-memory-stat strong, .nlk-memory-stat span { display: block; }
@@ -25341,6 +25563,8 @@ const CSS = `
   .nlk-model-picker { grid-template-columns: 1fr; }
   .nlk-model-select-head, .nlk-tier-lock-callout, .nlk-memory-head { align-items: stretch; flex-direction: column; }
   .nlk-ai-question-grid, .nlk-memory-stats { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .nlk-memory-observer { grid-template-columns: 1fr; }
+  .nlk-memory-archive-progress { padding-left: 0; padding-top: 10px; border-left: 0; border-top: 1px solid var(--nlk-border); }
   .nlk-ai-question-main { grid-column: 1 / -1; }
   .nlk-memory-toolbar { grid-template-columns: 1fr 1fr; }
   .nlk-memory-search { grid-column: 1 / -1; }
@@ -25458,12 +25682,18 @@ function mountPanel(deps) {
             return;
         }
         const contract = deps.adapter.adapter.contract;
+        const activity = deps.adapter.adapter.activity;
+        const activityFresh = activity && (activity.status === 'running' || Date.now() - activity.at < 10_000);
         const enabled = contract?.memory?.enabled || contract?.plot?.enabled || contract?.dice?.enabled
             ? ` · ${[contract.memory?.enabled ? '记忆' : '', contract.plot?.enabled ? '剧情' : '', contract.dice?.enabled ? '检定' : ''].filter(Boolean).join('+') || ''}`
             : '';
         const summary = `轮次 ${state.meta.lastTurnId} · 待复核 ${state.meta.pending.length}${enabled}`;
-        float.textContent = `万花筒${compat && !compat.compatible ? ' ⚠' : ''} · 打开面板 · ${summary}`;
-        runtimeStatus.textContent = `${compat?.compatible === false ? `兼容性缺失：${compat.missing.join(', ')}` : '运行正常'} · ${summary}`;
+        float.textContent = activityFresh
+            ? `万花筒 · ${activity.message}`
+            : `万花筒${compat && !compat.compatible ? ' ⚠' : ''} · 打开面板 · ${summary}`;
+        runtimeStatus.textContent = activityFresh
+            ? activity.message
+            : `${compat?.compatible === false ? `兼容性缺失：${compat.missing.join(', ')}` : '运行正常'} · ${summary}`;
     }
     updateFloat();
     // §11.1 实例级隔离：不写 window.Vue、不调全局 app.component。
@@ -25502,6 +25732,15 @@ function mountPanel(deps) {
         });
         // §20.10 记忆事件驱动刷新（不轮询）
         eventSource.on('nlkaleido:memory_changed', () => { store.memoryVersion += 1; });
+        eventSource.on('nlkaleido:activity_changed', (payload) => {
+            const activity = payload;
+            store.activityVersion += 1;
+            store.activityMessage = activity?.message ?? '';
+            store.activityStatus = activity?.status ?? 'info';
+            updateFloat();
+            if (activity?.status !== 'running')
+                setTimeout(updateFloat, 10_100);
+        });
         // §22.6 剧情事件驱动刷新（不轮询）
         eventSource.on('nlkaleido:plot_changed', () => { store.plotVersion += 1; });
         // §23.7 检定事件驱动刷新（不轮询）
@@ -25572,7 +25811,7 @@ let adapter = null;
 let startupState = 'idle';
 let startupError = null;
 let previousChatId = null;
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 /** 稳定 API 入口（每次取新鲜引用：chatMetadata 在切聊天后引用会变，文档警告不可长持） */
 function getStContext() {
     const globalObject = globalThis;
@@ -25642,6 +25881,7 @@ async function startRuntime() {
     adapter.onAchievementUnlocked = (achievements) => bridge.notifyAchievementUnlocked(achievements);
     // M13 记忆生命周期（§20.10：nlkaleido:memory_changed；默认关闭零路径）
     adapter.onMemoryChanged = () => bridge.notifyMemoryChanged();
+    adapter.onActivityChanged = () => bridge.notifyActivityChanged();
     // M15 剧情生命周期（§22.6：nlkaleido:plot_changed；默认关闭零路径）
     adapter.onPlotChanged = () => bridge.notifyPlotChanged();
     adapter.onEjsChanged = () => bridge.notifyEjsChanged();
@@ -25692,7 +25932,10 @@ async function hydrateCurrentChat() {
     else {
         adapter.adapter.memoryStore = { version: 1, atoms: [] };
         adapter.adapter.memoryTables = [];
+        adapter.adapter.memoryReceipts = [];
     }
+    adapter.adapter.activity = null;
+    adapter.adapter.activityHistory = [];
     if (contract.plot?.enabled)
         adapter.loadPlotState();
     else {
