@@ -4,10 +4,76 @@
  */
 import { mountAuthorStudio } from './app.js';
 import styles from '../../studio/styles.css?inline';
+import { mountPlayerStatus } from '../player/ui.js';
+import { createStPlayerSource, type PlayerStContext } from '../player/st-source.js';
+import { STORAGE_CONTRACT } from './model.js';
+import playerStyles from '../../studio/player.css?inline';
 
 const LAUNCHER_ID = 'nlkaleido-author-studio-preview-launcher';
 const OVERLAY_ID = 'nlkaleido-author-studio-preview-overlay';
 let closePreview: (() => void) | null = null;
+const PLAYER_HOST_ID = 'nlkaleido-player-preview-host';
+type EventContext = PlayerStContext & {
+  eventSource?: {on:(event:string,fn:()=>void)=>void; removeListener?:(event:string,fn:()=>void)=>void};
+  eventTypes?: {CHAT_CHANGED?:string; GENERATION_ENDED?:string};
+};
+type StApi = {getContext?:()=>EventContext};
+let stApiPromise: Promise<StApi | null> | null = null;
+let playerDestroy:(()=>void)|null=null;
+
+async function getCurrentStContext():Promise<EventContext|null>{
+  try{
+    if(!stApiPromise){
+      const moduleUrl = new URL('scripts/extensions.js', document.baseURI).href;
+      stApiPromise=import(/* @vite-ignore */ moduleUrl).then(
+        (module:unknown)=>module as StApi,
+        ()=>null
+      );
+    }
+    const api=await stApiPromise;
+    return typeof api?.getContext==='function'?api.getContext():null;
+  }catch{return null;}
+}
+
+function initializePlayerPreview():void {
+  if(document.getElementById(PLAYER_HOST_ID))return;
+  const host=document.createElement('div');
+  host.id=PLAYER_HOST_ID;
+  const shadow=host.attachShadow({mode:'open'});
+  const style=document.createElement('style');
+  style.textContent=playerStyles;
+  const root=document.createElement('div');
+  shadow.append(style,root);
+  document.body.append(host);
+
+  const read=createStPlayerSource(
+    getCurrentStContext,
+    ()=>localStorage.getItem(STORAGE_CONTRACT)
+  );
+  const hud=mountPlayerStatus(root,read);
+  let unsubscribe:(()=>void)|null=null;
+  playerDestroy=()=>{
+    unsubscribe?.();
+    hud.destroy();
+    host.remove();
+    playerDestroy=null;
+  };
+
+  // Refresh after supported ST chat changes; read current chat on each event.
+  void getCurrentStContext().then(context=>{
+    if(!context||!host.isConnected)return;
+    const source=context.eventSource;
+    const eventNames=[context.eventTypes?.CHAT_CHANGED,context.eventTypes?.GENERATION_ENDED].filter(
+      (name):name is string=>typeof name==='string'&&name.length>0
+    );
+    const onChange=()=>{void hud.refresh();};
+    for(const name of eventNames)source?.on(name,onChange);
+    unsubscribe=()=>{
+      for(const name of eventNames)source?.removeListener?.(name,onChange);
+    };
+  });
+}
+
 
 export function openPreview(): void {
   if (document.getElementById(OVERLAY_ID)) return;
@@ -82,6 +148,7 @@ export function openPreview(): void {
 }
 
 export function initializePreview(): void {
+  initializePlayerPreview();
   if (document.getElementById(LAUNCHER_ID)) return;
   const button = document.createElement('button');
   button.id = LAUNCHER_ID;
@@ -100,6 +167,7 @@ export function initializePreview(): void {
 }
 
 export function destroyPreview(): void {
+  playerDestroy?.();
   closePreview?.();
   document.getElementById(LAUNCHER_ID)?.remove();
 }
