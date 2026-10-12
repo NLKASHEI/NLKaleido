@@ -13,6 +13,8 @@ export type ArchiveAudit={
 export type UpdateArchive={
   schemaVersion:1;
   scope:string;
+  /** Off by default: automatic requests may cost tokens. */
+  autoEnabled:boolean;
   contract:Contract;
   snapshot:Snapshot;
   watermarks:Record<string,number>;
@@ -59,6 +61,8 @@ function readArchive(captured:StChatContext):UpdateArchive|null{
     throw new Error('更新存档结构损坏，拒绝覆盖');
   // The stored record is untrusted until validated; never accept prototype keys.
   const saved=copyJson(raw);
+  if(saved.autoEnabled!==undefined&&typeof saved.autoEnabled!=='boolean')
+    throw new Error('自动更新开关数据不合法');
   const contract=parseContract(saved.contract);
   const snapshot=readSnapshot(contract,raw.snapshot);
   if(snapshot.contractId!==contract.id)throw new Error('更新存档的契约不匹配');
@@ -69,7 +73,7 @@ function readArchive(captured:StChatContext):UpdateArchive|null{
     throw new Error('非法历史指纹列表');
   if(raw.audit.length>1000||Object.keys(raw.receipts).length>2000)
     throw new Error('审计或提交记录超出安全上限');
-  return saved as UpdateArchive;
+  return {...saved,autoEnabled:saved.autoEnabled===true} as UpdateArchive;
 }
 
 export function getCurrentUpdateArchive(context:StChatContext):UpdateArchive|null{
@@ -117,12 +121,26 @@ export function createStChatUpdateLedger(port:ChatLedgerPort){
       if(archive)throw new Error('聊天已有变量契约；安装不会覆盖已有数据');
       const contract=parseContract(contractInput);
       const draft:UpdateArchive={
-        schemaVersion:1,scope:timeline.scope,contract:JSON.parse(JSON.stringify(contract)) as Contract,
+        schemaVersion:1,scope:timeline.scope,autoEnabled:false,contract:JSON.parse(JSON.stringify(contract)) as Contract,
         snapshot:initialSnapshot(contract),watermarks:{},processedHashes:[],
         receipts:{},audit:[],
       };
       await persist(ctx,timeline.scope,draft);
       return copyJson(draft);
+    });
+  }
+
+  async function setAutoEnabled(enabled:boolean):Promise<boolean>{
+    return serialized(async()=>{
+      if(typeof enabled!=='boolean')throw new Error('自动更新设置必须为布尔值');
+      const {ctx,timeline,archive}=await capture();
+      if(!archive)throw new Error('请先为当前聊天绑定变量契约');
+      assertTimelineCompatible(archive.processedHashes,timeline);
+      if(archive.autoEnabled===enabled)return enabled;
+      const next=copyJson(archive);
+      next.autoEnabled=enabled;
+      await persist(ctx,timeline.scope,next);
+      return enabled;
     });
   }
 
@@ -144,10 +162,11 @@ export function createStChatUpdateLedger(port:ChatLedgerPort){
    * independently verified durable save result. This cannot by itself
    * provide cross-tab ACID guarantees.
    */
-  async function commit(tx:UpdateCommit,baseline:ChatTimeline):Promise<CommitStatus>{
+  async function commit(tx:UpdateCommit,baseline:ChatTimeline,requireAutoEnabled=false):Promise<CommitStatus>{
     return serialized(async()=>{
       const {ctx,timeline,archive}=await capture();
       if(!archive)throw new Error('当前聊天尚未安装变量契约');
+      if(requireAutoEnabled&&!archive.autoEnabled)throw new Error('该聊天已关闭自动更新');
       if(tx.scope!==archive.scope||baseline.scope!==tx.scope)
         throw new Error('更新来源聊天不一致');
       assertTimelineCompatible(archive.processedHashes,timeline);
@@ -206,9 +225,10 @@ export function createStChatUpdateLedger(port:ChatLedgerPort){
     });
   }
 
-  async function run(propose:(observation:UpdateObservation,feedback?:string)=>Promise<unknown>):Promise<UpdateCycleResult>{
+  async function run(propose:(observation:UpdateObservation,feedback?:string)=>Promise<unknown>,requireAutoEnabled=false):Promise<UpdateCycleResult>{
     const {ctx,timeline,archive}=await capture();
     if(!archive)throw new Error('请先将契约明确安装到当前聊天');
+    if(requireAutoEnabled&&!archive.autoEnabled)throw new Error('当前聊天未启用自动更新');
     assertTimelineCompatible(archive.processedHashes,timeline);
     return runVariableUpdateCycle({
       scope:timeline.scope,
@@ -220,10 +240,10 @@ export function createStChatUpdateLedger(port:ChatLedgerPort){
       propose,
       atomicCommit:async tx=>{
         assertCurrent(port.current,ctx,timeline.scope);
-        await commit(tx,timeline);
+        await commit(tx,timeline,requireAutoEnabled);
       },
     });
   }
-  return {install,preview,commit,run,read:()=>readArchive(port.current()),
+  return {install,setAutoEnabled,preview,commit,run,read:()=>readArchive(port.current()),
     get quarantined(){return quarantined;}};
 }

@@ -42,10 +42,13 @@ export class AuthorStudio {
   private proposals: Proposal[] = [];
   private history: AuditEntry[] = [];
   private installToChat?: (contract:Contract)=>Promise<void>;
+  private toggleAuto?:()=>Promise<boolean>;
+  private autoState:boolean|undefined;
 
-  constructor(root: HTMLElement,installToChat?:(contract:Contract)=>Promise<void>) {
+  constructor(root: HTMLElement,installToChat?:(contract:Contract)=>Promise<void>,toggleAuto?:()=>Promise<boolean>) {
     this.root = root;
     this.installToChat=installToChat;
+    this.toggleAuto=toggleAuto;
     try {
       this.contract = parseContract(JSON.parse(localStorage.getItem(STORAGE_CONTRACT)??'null'));
     } catch {
@@ -124,6 +127,15 @@ export class AuthorStudio {
       }
       if(action==='delete' && this.selected && window.confirm('确定删除「'+this.selected+'」吗？所依赖它的字段将自动移除依赖。')){
         this.mutate(()=>removeField(this.contract,this.selected));
+      }
+      if(action==='toggle-auto' && this.toggleAuto){
+        void this.toggleAuto().then(
+          enabled=>{
+            this.autoState=enabled;
+            this.notify(enabled?'当前聊天已开启自动更新（每次模型调用可能产生费用）。':'当前聊天已关闭自动更新。');
+          },
+          e=>this.notify('自动更新设置失败：'+(e instanceof Error?e.message:String(e)),true)
+        );
       }
       if(action==='bind-chat' && this.installToChat){
         if(this.dirty){
@@ -455,6 +467,9 @@ export class AuthorStudio {
       '<h1>变量契约</h1><p>定义角色卡的变量结构、类型与更新规则，让每一次状态变化都可靠且清晰。</p></div>'+
       '<div class="page-actions">'+
       (this.installToChat?'<button class="button subtle" data-action="bind-chat">↗ 绑定当前聊天（实验）</button>':'')+
+      (this.toggleAuto?'<button class="button subtle" data-action="toggle-auto">⚡ '+
+        (this.autoState===true?'关闭自动更新':this.autoState===false?'开启自动更新':'自动更新设置')+
+        '</button>':'')+
       '<button class="button subtle" data-action="import">'+glyph('import')+'导入</button>'+
       '<button class="button subtle" data-action="export">'+glyph('export')+'导出</button>'+
       '<button class="button subtle" data-action="audit">'+glyph('play')+'测试更新</button>'+
@@ -536,6 +551,6 @@ export class AuthorStudio {
   }
 }
 
-export function mountAuthorStudio(root: HTMLElement, installToChat?:(contract:Contract)=>Promise<void>): AuthorStudio {
-  return new AuthorStudio(root,installToChat);
+export function mountAuthorStudio(root: HTMLElement, installToChat?:(contract:Contract)=>Promise<void>,toggleAuto?:()=>Promise<boolean>): AuthorStudio {
+  return new AuthorStudio(root,installToChat,toggleAuto);
 }
