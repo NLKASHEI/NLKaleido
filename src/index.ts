@@ -12,3 +12,6 @@ export { buildVariableUpdatePlan } from './update/scheduler.js';
 export type { UpdateFieldPolicy, ScheduledGroup, ScheduledUpdatePlan } from './update/scheduler.js';
 export { prepareVariableObservation, validateVariableDecisions, runVariableUpdateCycle } from './update/pipeline.js';
 export type { FieldDecision, UpdateObservation, UpdateCommit, UpdateCycleInput, UpdateCycleResult } from './update/pipeline.js';
+
+export { buildUpdatePrompt, parseProposalText } from './update/prompt.js';
+export { fuseRankedEvidence } from './update/fusion.js';

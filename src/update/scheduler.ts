@@ -63,7 +63,7 @@ export function buildVariableUpdatePlan(input:ScheduleInput):ScheduledUpdatePlan
     if(mode==='manual'||mode==='fixed'){disabled.push(rule.path);continue;}
     if(mode!=='afterReply'&&mode!=='immediate'){disabled.push(rule.path);continue;}
     const policy=input.policies?.[rule.path]??{};
-    const every=integer(policy.every,1,0,1000);
+    const every=integer(policy.every,rule.updateEvery??1,0,1000);
     if(!every){disabled.push(rule.path);continue;}
     const skip=integer(policy.skipLatest,0,0,1000);
     const batchSize=integer(policy.batchSize,3,1,100);
