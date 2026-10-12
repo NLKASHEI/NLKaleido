@@ -197,6 +197,16 @@ export class AuthorStudio {
     this.root.querySelectorAll<HTMLElement>('[data-searchable]').forEach(row=>{
       row.hidden=!(row.dataset.searchable??'').toLocaleLowerCase().includes(this.search.trim().toLocaleLowerCase());
     });
+    // A group heading is visible only if that namespace has a matching field.
+    this.root.querySelectorAll<HTMLElement>('[data-group-header]').forEach(heading=>{
+      let item=heading.nextElementSibling;
+      let visible=false;
+      while(item && !item.hasAttribute('data-group-header')) {
+        if(item.hasAttribute('data-searchable') && !(item as HTMLElement).hidden) { visible=true; break; }
+        item=item.nextElementSibling;
+      }
+      heading.hidden=!visible;
+    });
   }
 
   private save():void {
@@ -261,6 +271,12 @@ export class AuthorStudio {
     try {
       const result=await this.controller.setMany(updates);
       if(!result.ok)throw new Error(result.error);
+      if(!result.changed.length){
+        this.proposals=[];
+        this.message='当前状态已经包含这些值，无需重复提交。';
+        this.isError=false;
+        return;
+      }
       const entry:AuditEntry={
         id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7),
         at:new Date().toLocaleString('zh-CN'),
@@ -342,9 +358,14 @@ export class AuthorStudio {
     let fields=Object.values(this.contract.updateRules);
     if(this.typeFilter!=='all')fields=fields.filter(f=>f.type===this.typeFilter);
     if(this.grouped)fields.sort((a,b)=>a.path.localeCompare(b.path,'zh-CN'));
+    let previousGroup='';
     const rows=fields.map(f=>{
+      const group=f.path.split('.')[0]??'其他';
+      const groupHeading=this.grouped && group!==previousGroup?
+        '<div class="field-group" data-group-header="yes">'+escapeHtml(group)+'</div>':'';
+      previousGroup=group;
       const name=f.label||f.path.split('.').at(-1)||f.path;
-      return '<button class="field-row '+(this.selected===f.path?'selected':'')+'" data-action="select" data-path="'+escapeHtml(f.path)+
+      return groupHeading+'<button class="field-row '+(this.selected===f.path?'selected':'')+'" data-action="select" data-path="'+escapeHtml(f.path)+
         '" data-searchable="'+escapeHtml(f.path+' '+name+' '+(f.description??''))+'">'+
         '<span class="field-title"><span class="field-symbol">'+glyph(f.type==='number'?'heart':f.type==='list'?'bag':'world')+'</span><span><strong>'+
         escapeHtml(f.path)+'</strong><small>'+escapeHtml(f.description||name)+'</small></span></span>'+
