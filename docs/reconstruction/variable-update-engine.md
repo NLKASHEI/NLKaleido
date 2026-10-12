@@ -24,7 +24,7 @@ Ready for integration testing: source code with pure scheduler, field-aware BM25
 - `completedTurns`: ordered logical assistant turns, excluding canceled/incomplete/swipe-discarded content.
 - `lastProcessed`: durable per-field watermark. **Do not advance it before transaction success.**
 - `policies`: optional overrides (`every`, `skipLatest`, `batchSize`, `contextDepth`, `group`).
-- `propose(observation)`: model API adapter; pass `buildUpdatePrompt(observation)` to the model; `parseProposalText` strictly parses its response.
+- `propose(observation, feedback?)`: model API adapter; pass `buildUpdatePrompt(observation)` to the model; JSON or fenced JSON replies are parsed. One constrained correction retry is allowed by default if validation fails (maximum 2 configured retries).
 - `atomicCommit(tx)`: the host must verify `expected`, perform contract-valid state commit and watermark update, record an immutable audit, and durably dedupe the `scope,key` transaction; fail closed if the chat changed.
 - `result.errors` reports invalid outputs, unsupported evidence and unsuccessful persistence **without** claiming the failed fields were updated.
 

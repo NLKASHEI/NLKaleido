@@ -2,6 +2,7 @@ import { assertRuleValue, copyJson, parseContract, type Contract } from '../core
 import { applyValues, getValue, readSnapshot, type Snapshot } from '../core/state.js';
 import { BM25FIndex, type EvidenceDocument, type EvidenceHit } from './bm25f.js';
 import { buildVariableUpdatePlan, type ScheduleInput, type ScheduledGroup } from './scheduler.js';
+import { parseProposalText } from './prompt.js';
 
 export type FieldDecision = {
   path: string;
@@ -34,7 +35,10 @@ export type UpdateCycleInput = ScheduleInput & {
   /** Production adapter must implement one durable transaction for all three. */
   atomicCommit: (commit:UpdateCommit)=>Promise<void>;
   /** Model adapter only PROPOSES; it cannot touch mutable state. */
-  propose: (observation:UpdateObservation)=>Promise<unknown>;
+  /** Optional feedback is a compact validation error for one correction retry. */
+  propose: (observation:UpdateObservation,feedback?:string)=>Promise<unknown>;
+  /** Default 1. Never exceed 2 correction attempts. */
+  maxRepairAttempts?:number;
 };
 export type UpdateCycleResult = {
   planned:number;
@@ -152,6 +156,7 @@ export function validateVariableDecisions(
     for(const id of ids)if(!evidenceById.has(id))throw new Error('模型引用了观察范围以外的证据');
     const prior=getValue(contract,snapshot,rule.path);
     expected[rule.path]=prior;
+    for(const dependency of rule.dependencies??[])expected[dependency]=getValue(contract,snapshot,dependency);
     if(action==='set'){
       if(!Object.hasOwn(rawDecision,'value'))throw new Error('set 操作缺少值');
       assertRuleValue(rule,rawDecision.value);
@@ -181,6 +186,8 @@ export async function runVariableUpdateCycle(input:UpdateCycleInput):Promise<Upd
   const contract=parseContract(input.contract);
   const snapshot=readSnapshot(contract,input.snapshot);
   const documents=normalizeDocs(input.scope,input.documents);
+  const retryLimit=input.maxRepairAttempts??1;
+  if(!Number.isSafeInteger(retryLimit)||retryLimit<0||retryLimit>2)throw new Error('纠错重试次数必须为 0~2');
   const index=new BM25FIndex(input.scope);
   index.rebuild(documents);
   const plan=buildVariableUpdatePlan(input);
@@ -191,8 +198,23 @@ export async function runVariableUpdateCycle(input:UpdateCycleInput):Promise<Upd
   for(const group of plan.groups){
     try{
       const observation=prepareVariableObservation(contract,snapshot,group,documents,index);
-      const raw=await input.propose(observation);
-      const checked=validateVariableDecisions(raw,observation,contract,snapshot);
+      let checked:ReturnType<typeof validateVariableDecisions>|undefined;
+      let feedback: string|undefined;
+      for(let attempt=0;attempt<=retryLimit;attempt++){
+        const raw=await input.propose(observation,feedback);
+        try{
+          checked=validateVariableDecisions(
+            typeof raw==='string'?parseProposalText(raw):raw,
+            observation,contract,snapshot
+          );
+          break;
+        }catch(error){
+          feedback='修正上一轮格式/契约校验错误：'+
+            (error instanceof Error?error.message:String(error));
+          if(attempt===retryLimit)throw error;
+        }
+      }
+      if(!checked)throw new Error('模型未返回可用的变量更新提案');
       const advance:Record<string,number>=Object.create(null);
       for(const path of group.paths)advance[path]=group.advanceTo;
       await input.atomicCommit({
