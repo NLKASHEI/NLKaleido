@@ -182,7 +182,7 @@ export class AuthorStudio {
           patch={type,default:defaultFor(type),min:type==='number'?0:undefined,max:type==='number'?100:undefined};
         } else if(key==='default'){
           patch={default:rule.type==='string'?el.value:JSON.parse(el.value)};
-        } else if(key==='min'||key==='max'){
+        } else if(key==='min'||key==='max'||key==='maxDelta'||key==='updateEvery'){
           const value=el.value.trim()===''?undefined:Number(el.value);
           patch={ [key]:value };
         } else patch={ [key]:el.value };
@@ -389,7 +389,16 @@ export class AuthorStudio {
       '</label><label class="form-control"><span>更新时机</span><select data-edit="updateMode">'+modes.map(mode=>
         '<option value="'+mode+'" '+(mode===rule.updateMode?'selected':'')+'>'+
         escapeHtml(UPDATE_LABELS[mode])+'</option>').join('')+'</select></label></div>'+
+      '<div class="form-control"><span>自动检查间隔 <em>每轮检查最及时；0 为关闭自动检查</em></span>'+
+      '<select data-edit="updateEvery"><option value="1" '+((rule.updateEvery??1)===1?'selected':'')+'>每轮对话（推荐）</option>'+
+      '<option value="2" '+(rule.updateEvery===2?'selected':'')+'>每 2 轮</option>'+
+      '<option value="3" '+(rule.updateEvery===3?'selected':'')+'>每 3 轮</option>'+
+      '<option value="5" '+(rule.updateEvery===5?'selected':'')+'>每 5 轮</option>'+
+      '<option value="0" '+(rule.updateEvery===0?'selected':'')+'>不自动检查</option>'+
+      (rule.updateEvery!==undefined&&![0,1,2,3,5].includes(rule.updateEvery)?'<option value="'+rule.updateEvery+'" selected>每 '+rule.updateEvery+' 轮（自定义）</option>':'')+
+      '</select></div>'+
       (rule.type==='number'?'<div class="two-column">'+input('最小值','min',rule.min,'不限制')+input('最大值','max',rule.max,'不限制')+'</div>':'')+
+      (rule.type==='number'?input('单次最大变化','maxDelta',rule.maxDelta,'如 5；留空则不限制'):'')+
       '<label class="form-control"><span>AI 更新规则 <em>自然语言即可</em></span><textarea data-edit="changeRule" rows="4" placeholder="明确何时更改、何时保持，以及单次变化幅度。">'+
       escapeHtml(rule.changeRule??'')+'</textarea></label>'+
       '<div class="form-control"><span>依赖字段</span><div class="dependency-chips">'+

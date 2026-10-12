@@ -15,7 +15,7 @@ export const UPDATE_LABELS: Record<string, string> = {
 export const demoContract: Contract = parseContract({
   version: 1, id: '星海旅人',
   updateRules: {
-    '角色.好感度': {path:'角色.好感度',label:'角色好感度',type:'number',default:50,min:0,max:100,description:'玩家与角色之间的好感程度',changeRule:'只有与角色直接相关、能够改变关系的互动才能缓慢变化，单次不超过 5。',updateMode:'afterReply',display:true,dependencies:[]},
+    '角色.好感度': {path:'角色.好感度',label:'角色好感度',type:'number',default:50,min:0,max:100,maxDelta:5,description:'玩家与角色之间的好感程度',changeRule:'只有与角色直接相关、能够改变关系的互动才能缓慢变化，单次不超过 5。',updateMode:'afterReply',display:true,dependencies:[]},
     '背包.物资': {path:'背包.物资',label:'背包物资',type:'list',default:[],description:'玩家持有的重要物品',changeRule:'确实拾取物品后加入；消耗或丢弃后移除，不得无依据新增。',updateMode:'afterReply',display:true,dependencies:[]},
     '世界.阶段': {path:'世界.阶段',label:'世界阶段',type:'string',default:'序章',description:'当前所处的叙事章节',changeRule:'重大章节条件完成后才推进；普通对话保持不变。',updateMode:'afterReply',display:true,dependencies:[]},
     '剧情.关键标记': {path:'剧情.关键标记',label:'剧情标记',type:'boolean',default:false,description:'重要剧情节点是否被触发',changeRule:'仅在关键事件明确发生时写为 true。',updateMode:'manual',display:false,dependencies:['世界.阶段']},
