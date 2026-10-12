@@ -1,4 +1,6 @@
 node_modules/
 .build/
+.ui-build/
+.preview-extension-build/
 coverage/
 *.tsbuildinfo

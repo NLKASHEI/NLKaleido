@@ -15,3 +15,9 @@ jobs:
       - run: npm run check
       - name: Ensure shipped legacy bundle was not rewritten
         run: git diff --exit-code HEAD -- manifest.json dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nlkaleido-st-author-studio-preview
+          path: .preview-extension-build/
+          if-no-files-found: error
+          include-hidden-files: true
