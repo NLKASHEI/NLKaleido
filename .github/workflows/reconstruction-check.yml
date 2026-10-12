@@ -20,3 +20,4 @@ jobs:
           name: nlkaleido-st-author-studio-preview
           path: .preview-extension-build/
           if-no-files-found: error
+          include-hidden-files: true
