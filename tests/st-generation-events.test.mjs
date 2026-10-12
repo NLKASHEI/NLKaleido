@@ -13,7 +13,7 @@ function fakeContext(){
     chat:[{is_user:true,mes:'谢谢你愿意帮忙'},
       {is_user:false,mes:'角色表示愿意继续同行'}],
     chatMetadata:{},
-    eventTypes:{GENERATION_ENDED:'generation_ended',GENERATION_STOPPED:'generation_stopped'},
+    eventTypes:{GENERATION_STARTED:'generation_started',GENERATION_ENDED:'generation_ended',GENERATION_STOPPED:'generation_stopped'},
     eventSource:{
       on:(name,fn)=>{handlers.set(name,fn);},
       removeListener:(name)=>{handlers.delete(name);}
@@ -71,6 +71,10 @@ test('generation-ended event opt-in launches exactly one checked cycle; stopped 
   await Promise.resolve();
   assert.equal(f.generationCount,0);
   f.emit('generation_ended');
+  await new Promise(resolve=>setTimeout(resolve,8));
+  assert.equal(f.generationCount,0); // stop must block even if ENDED emitted
+  f.emit('generation_started');
+  f.emit('generation_ended');
   await finished;
   assert.equal(f.generationCount,1);
   assert.equal(lastSignal.kind,'updated');
@@ -96,4 +100,25 @@ test('raw provider rejects chat switch after the in-flight LLM request',async()=
   f.ctx.chatId='new-room';
   release();
   await assert.rejects(promise,/聊天已切换/);
+});
+
+test('SillyTavern stop order ENDED -> STOPPED cannot issue any model call',async()=>{
+  const f=fakeContext();
+  const ledger=createStChatUpdateLedger({
+    current:()=>f.ctx,
+    saveAndConfirm:async()=>({durable:true}),
+  });
+  await ledger.install(demoContract);
+  await ledger.setAutoEnabled(true);
+  const events=[];
+  const observer=attachStAutoUpdateEvents(()=>f.ctx,ledger,x=>events.push(x));
+  f.emit('generation_started');
+  f.emit('generation_ended'); // hideStopButton emits this during Stop
+  f.emit('generation_stopped'); // stopGeneration emits this immediately after
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(f.generationCount,0);
+  assert.equal(ledger.read().audit.length,0);
+  assert.equal(events.length,0);
+  observer.dispose();
+  assert.equal(f.handlers.size,0);
 });

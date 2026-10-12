@@ -3,7 +3,7 @@ import { createStRawProposalProvider, type StGenerationContext } from './st-gene
 import type { UpdateCycleResult } from '../update/pipeline.js';
 
 export type StEventContext=StGenerationContext & {
-  eventTypes?:{GENERATION_ENDED?:string;GENERATION_STOPPED?:string;CHAT_CHANGED?:string};
+  eventTypes?:{GENERATION_STARTED?:string;GENERATION_ENDED?:string;GENERATION_STOPPED?:string;CHAT_CHANGED?:string};
   eventSource?:{
     on:(event:string,handler:()=>void)=>void;
     removeListener?:(event:string,handler:()=>void)=>void;
@@ -14,8 +14,11 @@ export type RuntimeSignal={
 };
 
 /**
- * Opt-in lifecycle: only successful completed generations may trigger
- * a review request. Never update on user STOP, partial stream, or chat change.
+ * Opt-in lifecycle. WARNING: ST emits GENERATION_ENDED from hideStopButton()
+ * even when the user presses Stop, before GENERATION_STOPPED fires.
+ * Defer the ended callback for one event-loop tick to observe the stop event.
+ * This guard covers explicit stops, not all failure modes; a live ST QA pass
+ * is still required before promoting this to the default extension.
  */
 export function attachStAutoUpdateEvents(
   getContext:()=>StEventContext,
@@ -25,9 +28,15 @@ export function attachStAutoUpdateEvents(
   const context=getContext();
   const emitter=context.eventSource;
   const ended=context.eventTypes?.GENERATION_ENDED;
-  if(!emitter||!ended)throw new Error('酒馆未提供生成完成事件，自动更新不可用');
+  const stoppedEvent=context.eventTypes?.GENERATION_STOPPED;
+  const startedEvent=context.eventTypes?.GENERATION_STARTED;
+  if(!emitter||!ended||!stoppedEvent||!startedEvent)
+    throw new Error('酒馆缺少生成开始/停止/结束事件，禁止自动更新');
   let active=false;
   let disposed=false;
+  let stopped=false;
+  let stopVersion=0;
+  let pendingEnd:ReturnType<typeof setTimeout>|null=null;
   const run=async():Promise<void>=>{
     if(active||disposed)return;
     let archive:ReturnType<typeof ledger.read>=null;
@@ -37,7 +46,15 @@ export function attachStAutoUpdateEvents(
     active=true;
     try{
       const proposer=createStRawProposalProvider(getContext);
-      const result=await ledger.run(proposer,true);
+      const startedWithStopVersion=stopVersion;
+      const result=await ledger.run(async (observation,feedback)=>{
+        if(disposed||stopped||stopVersion!==startedWithStopVersion)
+          throw new Error('用户已中止变量更新请求');
+        const response=await proposer(observation,feedback);
+        if(disposed||stopped||stopVersion!==startedWithStopVersion)
+          throw new Error('用户中止生成，禁止采用已结束请求的提案');
+        return response;
+      },true);
       if(disposed)return;
       if(result.errors.length){
         onSignal({kind:'error',scope:archive.scope,
@@ -53,12 +70,30 @@ export function attachStAutoUpdateEvents(
         message:err instanceof Error?err.message:String(err)});
     }finally{active=false;}
   };
-  const onEnd=():void=>{void run();};
+  const onStart=():void=>{stopped=false;};
+  const onStop=():void=>{
+    stopped=true;
+    stopVersion++;
+    if(pendingEnd!==null){clearTimeout(pendingEnd);pendingEnd=null;}
+  };
+  const onEnd=():void=>{
+    if(disposed||stopped||pendingEnd!==null)return;
+    // ST Stop invokes hideStopButton() -> ENDED before emitting STOPPED.
+    pendingEnd=setTimeout(()=>{
+      pendingEnd=null;
+      if(!disposed&&!stopped)void run();
+    },0);
+  };
+  emitter.on(startedEvent,onStart);
+  emitter.on(stoppedEvent,onStop);
   emitter.on(ended,onEnd);
   return {
     runNow:run,
     dispose:()=>{
       disposed=true;
+      if(pendingEnd!==null){clearTimeout(pendingEnd);pendingEnd=null;}
+      emitter.removeListener?.(startedEvent,onStart);
+      emitter.removeListener?.(stoppedEvent,onStop);
       emitter.removeListener?.(ended,onEnd);
     },
   };
