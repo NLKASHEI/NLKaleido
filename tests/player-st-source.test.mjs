@@ -24,3 +24,21 @@ test('missing chat or incompatible contract return an empty/error view',async()=
   const bad=createStPlayerSource(async()=>({chatId:'x',chatMetadata:{[key]:{schemaVersion:99}}}),()=>saved);
   assert.equal((await bad()).kind,'error');
 });
+
+test('player reads verified per-chat update archive without global localStorage contract',async()=>{
+  const {createStPlayerSource}=await import('../.build/player/st-source.js');
+  const {createStChatUpdateLedger,UPDATE_ARCHIVE_KEY}=await import('../.build/runtime/update-ledger.js');
+  const {demoContract}=await import('../.build/ui/model.js');
+  const ctx={chatId:'chat-ready',characterId:0,groupId:null,
+    chat:[{is_user:true,mes:'hello'},{is_user:false,mes:'world'}],chatMetadata:{}};
+  const ledger=createStChatUpdateLedger({
+    current:()=>ctx,
+    saveAndConfirm:async()=>({durable:true})
+  });
+  await ledger.install(demoContract);
+  const view=await createStPlayerSource(async()=>ctx,()=>null)();
+  assert.equal(view.kind,'ready');
+  assert.equal(view.view.title,'星海旅人');
+  assert.equal(view.view.metrics.find(x=>x.path==='角色.好感度').text,'50');
+  assert.ok(ctx.chatMetadata[UPDATE_ARCHIVE_KEY]);
+});

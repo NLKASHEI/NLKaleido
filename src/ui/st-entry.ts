@@ -8,6 +8,10 @@ import { mountPlayerStatus } from '../player/ui.js';
 import { createStPlayerSource, type PlayerStContext } from '../player/st-source.js';
 import { STORAGE_CONTRACT } from './model.js';
 import playerStyles from '../../studio/player.css?inline';
+import { createStChatUpdateLedger } from '../runtime/update-ledger.js';
+import { createVerifiedStChatPort } from '../runtime/st-verified-port.js';
+import type { Contract } from '../core/contract.js';
+import { attachStAutoUpdateEvents, type RuntimeSignal } from '../runtime/st-events.js';
 
 const LAUNCHER_ID = 'nlkaleido-author-studio-preview-launcher';
 const OVERLAY_ID = 'nlkaleido-author-studio-preview-overlay';
@@ -20,6 +24,39 @@ type EventContext = PlayerStContext & {
 type StApi = {getContext?:()=>EventContext};
 let stApiPromise: Promise<StApi | null> | null = null;
 let playerDestroy:(()=>void)|null=null;
+let playerRefresh:(()=>Promise<void>)|null=null;
+let ledger:ReturnType<typeof createStChatUpdateLedger>|null=null;
+let observer:ReturnType<typeof attachStAutoUpdateEvents>|null=null;
+
+async function ensureRuntime(){
+  if(!stApiPromise)await getCurrentStContext();
+  const api=await stApiPromise;
+  if(typeof api?.getContext!=='function')throw new Error('酒馆扩展 API 不可用');
+  if(!ledger){
+    ledger=createStChatUpdateLedger(createVerifiedStChatPort(()=>api.getContext!()));
+    observer=attachStAutoUpdateEvents(()=>api.getContext!(),ledger,(signal:RuntimeSignal)=>{
+      if(signal.kind==='error')console.warn('[NLKaleido Next] 自动更新暂停:',signal.message);
+      else console.info('[NLKaleido Next]',signal.message);
+      void playerRefresh?.();
+    });
+  }
+  return ledger;
+}
+async function bindCurrentChat(contract:Contract):Promise<void>{
+  const runtime=await ensureRuntime();
+  await runtime.install(contract);
+  await playerRefresh?.();
+}
+async function toggleCurrentAuto():Promise<boolean>{
+  const runtime=await ensureRuntime();
+  const archive=runtime.read();
+  if(!archive)throw new Error('请先保存作者契约，并绑定到当前聊天');
+  const enable=!archive.autoEnabled;
+  if(enable&&!window.confirm('启用自动更新后，每次角色正常生成结束可能调用当前选定的 LLM，消耗 Token。模型建议将经过本地校验和保存读回验证。确认启用吗？'))
+    return false;
+  const result=await runtime.setAutoEnabled(enable);
+  return result;
+}
 
 async function getCurrentStContext():Promise<EventContext|null>{
   try{
@@ -51,10 +88,12 @@ function initializePlayerPreview():void {
     ()=>localStorage.getItem(STORAGE_CONTRACT)
   );
   const hud=mountPlayerStatus(root,read);
+  playerRefresh=()=>hud.refresh();
   let unsubscribe:(()=>void)|null=null;
   playerDestroy=()=>{
     unsubscribe?.();
     hud.destroy();
+    playerRefresh=null;
     host.remove();
     playerDestroy=null;
   };
@@ -62,6 +101,7 @@ function initializePlayerPreview():void {
   // Refresh after supported ST chat changes; read current chat on each event.
   void getCurrentStContext().then(context=>{
     if(!context||!host.isConnected)return;
+    void ensureRuntime().catch(e=>console.warn('[NLKaleido Next] runtime inactive:',e));
     const source=context.eventSource;
     const eventNames=[context.eventTypes?.CHAT_CHANGED,context.eventTypes?.GENERATION_ENDED].filter(
       (name):name is string=>typeof name==='string'&&name.length>0
@@ -139,7 +179,7 @@ export function openPreview(): void {
   document.addEventListener('keydown', handleKey);
 
   try {
-    mountAuthorStudio(root);
+    mountAuthorStudio(root,bindCurrentChat,toggleCurrentAuto);
     close.focus();
   } catch (error) {
     console.error('[NLKaleido Preview] Studio failed to mount:', error);
@@ -167,6 +207,8 @@ export function initializePreview(): void {
 }
 
 export function destroyPreview(): void {
+  observer?.dispose();
+  observer=null;
   playerDestroy?.();
   closePreview?.();
   document.getElementById(LAUNCHER_ID)?.remove();
