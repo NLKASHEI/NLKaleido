@@ -173,12 +173,59 @@ export function createStChatUpdateLedger(port:ChatLedgerPort){
       if(baseline.hashes.length>timeline.hashes.length||
          baseline.hashes.some((hash,i)=>timeline.hashes[i]!==hash))
         throw new Error('提案生成期间消息被修改、重生成或切换，拒绝提交');
+      if(typeof tx.key!=='string'||tx.key.length>2048||
+         !tx.key.startsWith(tx.scope+'|'))
+        throw new Error('无效的提交标识，拒绝写入');
+      if(!record(tx.advance)||!record(tx.updates)||!record(tx.expected)||
+         !Array.isArray(tx.decisions))
+        throw new Error('更新事务格式不合法');
       const hash=await digest(tx);
       assertCurrent(port.current,ctx,tx.scope);
       const oldReceipt=archive.receipts[tx.key];
       if(oldReceipt){
         if(oldReceipt!==hash)throw new Error('重复提交键对应了不同内容');
         return 'duplicate';
+      }
+      const advancePaths=Object.keys(tx.advance);
+      const decisionPaths=tx.decisions.map(item=>item.path);
+      if(!advancePaths.length||advancePaths.length>50||
+         new Set(decisionPaths).size!==decisionPaths.length||
+         decisionPaths.length!==advancePaths.length||
+         advancePaths.some(path=>!decisionPaths.includes(path))||
+         Object.keys(tx.updates).some(path=>!advancePaths.includes(path)))
+        throw new Error('更新字段、处理进度和模型决定不一致');
+      const batchEvidence=new Map(baseline.documents.map(doc=>[doc.id,doc.turn]));
+      for(const decision of tx.decisions){
+        if(typeof decision.reason!=='string'||decision.reason.trim().length<4||
+           decision.reason.length>1500||
+           !Array.isArray(decision.evidenceIds)||decision.evidenceIds.length>12)
+          throw new Error('字段决定缺少合法的理由或证据');
+        const rule=archive.contract.updateRules[decision.path];
+        if(!rule||rule.updateMode==='manual'||rule.updateMode==='fixed')
+          throw new Error('自动更新尝试操作非自动字段');
+        const old=archive.watermarks[decision.path]??0;
+        const advanced=tx.advance[decision.path];
+        if(!Number.isSafeInteger(advanced)||advanced<=old||advanced>baseline.turns.length)
+          throw new Error('字段处理进度越界或倒退');
+        if(!Object.hasOwn(tx.expected,decision.path))
+          throw new Error('未提供字段旧值用于冲突校验');
+        for(const dependency of rule.dependencies??[]){
+          if(!Object.hasOwn(tx.expected,dependency))
+            throw new Error('缺少依赖变量旧值用于冲突校验');
+        }
+        if(decision.action==='set'){
+          if(!Object.hasOwn(tx.updates,decision.path)||
+             JSON.stringify(tx.updates[decision.path])!==JSON.stringify(decision.value))
+            throw new Error('提案内容与事务新值不一致');
+          if(!decision.evidenceIds.some(id=>{
+            const turn=batchEvidence.get(id);
+            return turn!==undefined&&turn>old&&turn<=advanced;
+          }))throw new Error('缺少当前更新批次的有效证据');
+        }else if(decision.action==='unchanged'){
+          if(Object.hasOwn(tx.updates,decision.path)||
+             Object.hasOwn(decision,'value'))
+            throw new Error('unchanged 不允许携带新值');
+        }else throw new Error('变量决定动作不合法');
       }
       if(Object.keys(archive.receipts).length>=1900||archive.audit.length>=950)
         throw new Error('审计/收据接近上限，需要导出归档后再继续');
