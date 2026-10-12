@@ -1,0 +1,37 @@
+name: Rebuild NLKaleido extension distribution
+on:
+  push:
+    branches:
+      - fix/st-runtime-release-audit
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --ignore-scripts
+      - run: npm run check
+      - name: Build the published SillyTavern entry
+        run: |
+          set -euo pipefail
+          test -s .preview-extension-build/index.js
+          cp .preview-extension-build/index.js dist/index.js
+          git rm -r -f dist/chunks
+          node --input-type=module -e "import fs from 'node:fs'; if(!fs.readFileSync('dist/index.js').equals(fs.readFileSync('.preview-extension-build/index.js')))process.exit(1); const m=JSON.parse(fs.readFileSync('manifest.json')); if(m.version!=='0.11.0'||m.js!=='dist/index.js')process.exit(1);"
+      - name: Commit tested compiled artifact
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A dist
+          if ! git diff --cached --quiet; then
+            git commit -m 'build: publish tested NLKaleido v0.11.0 extension'
+            git push
+          fi
