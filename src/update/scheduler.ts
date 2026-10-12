@@ -48,7 +48,7 @@ export function buildVariableUpdatePlan(input:ScheduleInput):ScheduledUpdatePlan
   const ordered=input.completedTurns;
   if(ordered.length>100000)throw new Error('对话轮次记录过多');
   for(let i=0;i<ordered.length;i++){
-    const turn=ordered[i];
+    const turn=ordered[i]!;
     if(!Number.isSafeInteger(turn)||turn<1||i>0&&turn<ordered[i-1]!)
       throw new Error('对话轮次必须为非负、有序、不重复的逻辑序号');
     if(i>0&&turn===ordered[i-1])throw new Error('不能提交重复的对话轮次');

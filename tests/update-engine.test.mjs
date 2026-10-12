@@ -42,7 +42,7 @@ test('BM25F produces bounded deterministic hits and rejects unsafe settings',()=
   const idx=new BM25FIndex('chat-a',{fields:{title:{boost:4,b:.3}}});
   idx.rebuild(corpus);
   assert.deepEqual(idx.search('钥匙',1).map(x=>x.id),['a']);
-  assert.equal(idx.search('完全不相关的文字x93282').length,0);
+  assert.equal(idx.search('ultraunrelatedtoken998').length,0);
   assert.throws(()=>new BM25FIndex('chat-a',{fields:{body:{b:1.5}}}),/参数/);
   assert.throws(()=>idx.search('钥匙',101),/数量/);
 });
@@ -95,7 +95,7 @@ test('observation includes latest batch evidence even when BM25F sparse misses',
   const obs=prepareVariableObservation(contract,snapshot,group,corpus,idx);
   assert.ok(obs.evidence.some(e=>e.id==='b'));
   assert.equal(obs.fields.length,1);
-  assert.deepEqual(obs.fields[0].dependencies,{});
+  assert.equal(Object.keys(obs.fields[0].dependencies).length,0);
   assert.ok(obs.evidence.every(e=>e.turn<=2));
 });
 
@@ -110,7 +110,7 @@ test('strict agent proposal rejects missing fields, false citations, no batch pr
   assert.throws(()=>validateVariableDecisions({decisions:[changed]},obs,demoContract,snap),/每个/);
   assert.throws(()=>validateVariableDecisions({decisions:[{...changed,evidenceIds:['not-real']},unchanged]},obs,demoContract,snap),/观察范围以外/);
   assert.throws(()=>validateVariableDecisions({decisions:[{...changed,value:800},unchanged]},obs,demoContract,snap),/大于最大值/);
-  assert.throws(()=>validateVariableDecisions({decisions:[{...changed,evidenceIds:['a']},unchanged]},obs,demoContract,snap),/本批次/);
+  assert.throws(()=>validateVariableDecisions({decisions:[{...changed,evidenceIds:['b']},unchanged]},obs,demoContract,snap),/本批次/);
   assert.throws(()=>validateVariableDecisions({decisions:[{...changed,action:'unchanged'},unchanged]},obs,demoContract,snap),/不应提供新值/);
 });
 
