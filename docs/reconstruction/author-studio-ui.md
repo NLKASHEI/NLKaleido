@@ -14,7 +14,7 @@ Open the URL printed by Vite. The compiled UI goes to `.ui-build/`. The original
 
 ## Implemented
 
-- Contract editor: browse, search, type filter, add, rename, delete, type/default/range/update timing, natural-language change rules, dependency picker and visibility.
+- Contract editor: browse, live search, type filter, **real namespace grouping** (not just alphabetical sorting), add, rename, delete, type/default/range/update timing, natural-language change rules, dependency picker and visibility.
 - Contract JSON import/export, browser-local save, inline error feedback, player-view preview and structural checks.
 - Audit demo: sample conversation/observation, explicit mock proposals, individual approvals, before/after diff, contract-checked commit, browser-local history and guarded rollback.
 - Unified responsive light/dark design. Pending modules are labeled "规划中", not fake functional buttons.
