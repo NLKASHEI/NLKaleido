@@ -8,6 +8,9 @@ import { mountPlayerStatus } from '../player/ui.js';
 import { createStPlayerSource, type PlayerStContext } from '../player/st-source.js';
 import { STORAGE_CONTRACT } from './model.js';
 import playerStyles from '../../studio/player.css?inline';
+import { createStChatUpdateLedger } from '../runtime/update-ledger.js';
+import { createVerifiedStChatPort } from '../runtime/st-verified-port.js';
+import type { Contract } from '../core/contract.js';
 
 const LAUNCHER_ID = 'nlkaleido-author-studio-preview-launcher';
 const OVERLAY_ID = 'nlkaleido-author-studio-preview-overlay';
@@ -20,6 +23,18 @@ type EventContext = PlayerStContext & {
 type StApi = {getContext?:()=>EventContext};
 let stApiPromise: Promise<StApi | null> | null = null;
 let playerDestroy:(()=>void)|null=null;
+let playerRefresh:(()=>Promise<void>)|null=null;
+let ledger:ReturnType<typeof createStChatUpdateLedger>|null=null;
+async function bindCurrentChat(contract:Contract):Promise<void>{
+  if(!stApiPromise)await getCurrentStContext();
+  const api=await stApiPromise;
+  if(typeof api?.getContext!=='function')
+    throw new Error('酒馆扩展 API 不可用');
+  // Keep one quarantine guard per extension session, even after a failed save.
+  if(!ledger)ledger=createStChatUpdateLedger(createVerifiedStChatPort(()=>api.getContext!()));
+  await ledger.install(contract);
+  await playerRefresh?.();
+}
 
 async function getCurrentStContext():Promise<EventContext|null>{
   try{
@@ -51,10 +66,12 @@ function initializePlayerPreview():void {
     ()=>localStorage.getItem(STORAGE_CONTRACT)
   );
   const hud=mountPlayerStatus(root,read);
+  playerRefresh=()=>hud.refresh();
   let unsubscribe:(()=>void)|null=null;
   playerDestroy=()=>{
     unsubscribe?.();
     hud.destroy();
+    playerRefresh=null;
     host.remove();
     playerDestroy=null;
   };
@@ -139,7 +156,7 @@ export function openPreview(): void {
   document.addEventListener('keydown', handleKey);
 
   try {
-    mountAuthorStudio(root);
+    mountAuthorStudio(root,bindCurrentChat);
     close.focus();
   } catch (error) {
     console.error('[NLKaleido Preview] Studio failed to mount:', error);

@@ -18,3 +18,4 @@ export { fuseRankedEvidence } from './update/fusion.js';
 
 export { chatScope, extractChatTimeline, assertTimelineCompatible } from './runtime/chat-timeline.js';
 export { UPDATE_ARCHIVE_KEY, getCurrentUpdateArchive, createStChatUpdateLedger } from './runtime/update-ledger.js';
+export { createVerifiedStChatPort } from './runtime/st-verified-port.js';

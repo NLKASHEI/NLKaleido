@@ -41,9 +41,11 @@ export class AuthorStudio {
   private busy = false;
   private proposals: Proposal[] = [];
   private history: AuditEntry[] = [];
+  private installToChat?: (contract:Contract)=>Promise<void>;
 
-  constructor(root: HTMLElement) {
+  constructor(root: HTMLElement,installToChat?:(contract:Contract)=>Promise<void>) {
     this.root = root;
+    this.installToChat=installToChat;
     try {
       this.contract = parseContract(JSON.parse(localStorage.getItem(STORAGE_CONTRACT)??'null'));
     } catch {
@@ -122,6 +124,16 @@ export class AuthorStudio {
       }
       if(action==='delete' && this.selected && window.confirm('确定删除「'+this.selected+'」吗？所依赖它的字段将自动移除依赖。')){
         this.mutate(()=>removeField(this.contract,this.selected));
+      }
+      if(action==='bind-chat' && this.installToChat){
+        if(this.dirty){
+          this.notify('请先点击「保存」，然后再绑定到当前聊天。',true);
+        }else if(window.confirm('这会为当前聊天初始化一份独立的新变量存档。不会覆盖旧版万花筒变量，也无法自动替换已有新版契约。确认继续吗？')){
+          void this.installToChat(copyJson(this.contract)).then(
+            ()=>this.notify('当前聊天的新版契约已通过服务端读取验证；玩家状态栏可查看初始状态。'),
+            e=>this.notify('绑定失败：'+(e instanceof Error?e.message:String(e)),true)
+          );
+        }
       }
       if(action==='save'){this.save();}
       if(action==='export'){this.export();}
@@ -441,7 +453,9 @@ export class AuthorStudio {
   private contractPage():string{
     return '<div class="page-title-row"><div><div class="eyebrow">AUTHOR STUDIO · VARIABLE CONTRACT</div>'+
       '<h1>变量契约</h1><p>定义角色卡的变量结构、类型与更新规则，让每一次状态变化都可靠且清晰。</p></div>'+
-      '<div class="page-actions"><button class="button subtle" data-action="import">'+glyph('import')+'导入</button>'+
+      '<div class="page-actions">'+
+      (this.installToChat?'<button class="button subtle" data-action="bind-chat">↗ 绑定当前聊天（实验）</button>':'')+
+      '<button class="button subtle" data-action="import">'+glyph('import')+'导入</button>'+
       '<button class="button subtle" data-action="export">'+glyph('export')+'导出</button>'+
       '<button class="button subtle" data-action="audit">'+glyph('play')+'测试更新</button>'+
       '<button class="button primary" data-action="save">'+glyph('save')+'保存'+(this.dirty?' *':'')+'</button></div></div>'+
@@ -522,6 +536,6 @@ export class AuthorStudio {
   }
 }
 
-export function mountAuthorStudio(root: HTMLElement): AuthorStudio {
-  return new AuthorStudio(root);
+export function mountAuthorStudio(root: HTMLElement, installToChat?:(contract:Contract)=>Promise<void>): AuthorStudio {
+  return new AuthorStudio(root,installToChat);
 }
