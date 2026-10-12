@@ -182,7 +182,7 @@ export class AuthorStudio {
           patch={type,default:defaultFor(type),min:type==='number'?0:undefined,max:type==='number'?100:undefined};
         } else if(key==='default'){
           patch={default:rule.type==='string'?el.value:JSON.parse(el.value)};
-        } else if(key==='min'||key==='max'||key==='updateEvery'){
+        } else if(key==='min'||key==='max'||key==='maxDelta'||key==='updateEvery'){
           const value=el.value.trim()===''?undefined:Number(el.value);
           patch={ [key]:value };
         } else patch={ [key]:el.value };
@@ -398,6 +398,7 @@ export class AuthorStudio {
       (rule.updateEvery!==undefined&&![0,1,2,3,5].includes(rule.updateEvery)?'<option value="'+rule.updateEvery+'" selected>每 '+rule.updateEvery+' 轮（自定义）</option>':'')+
       '</select></div>'+
       (rule.type==='number'?'<div class="two-column">'+input('最小值','min',rule.min,'不限制')+input('最大值','max',rule.max,'不限制')+'</div>':'')+
+      (rule.type==='number'?input('单次最大变化','maxDelta',rule.maxDelta,'如 5；留空则不限制'):'')+
       '<label class="form-control"><span>AI 更新规则 <em>自然语言即可</em></span><textarea data-edit="changeRule" rows="4" placeholder="明确何时更改、何时保持，以及单次变化幅度。">'+
       escapeHtml(rule.changeRule??'')+'</textarea></label>'+
       '<div class="form-control"><span>依赖字段</span><div class="dependency-chips">'+

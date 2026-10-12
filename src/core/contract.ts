@@ -13,6 +13,8 @@ export type FieldRule = {
   dependencies?: string[];
   min?: number;
   max?: number;
+  /** Optional hard limit on absolute change per accepted numeric update. */
+  maxDelta?: number;
   display?: boolean;
 };
 export type Contract = { version: 1; id: string; updateRules: Record<string, FieldRule> };
@@ -103,7 +105,10 @@ export function parseContract(input: unknown): Contract {
     if (raw.display !== undefined && typeof raw.display !== 'boolean') throw new Error('display 必须是布尔值: ' + key);
     if (raw.min !== undefined && (typeof raw.min !== 'number' || !Number.isFinite(raw.min))) throw new Error('min 必须是有限数字: ' + key);
     if (raw.max !== undefined && (typeof raw.max !== 'number' || !Number.isFinite(raw.max))) throw new Error('max 必须是有限数字: ' + key);
-    if (raw.type !== 'number' && (raw.min !== undefined || raw.max !== undefined)) throw new Error('只有数值字段能设范围: ' + key);
+    if (raw.type !== 'number' && (raw.min !== undefined || raw.max !== undefined || raw.maxDelta !== undefined)) throw new Error('只有数值字段能设范围: ' + key);
+    if (raw.maxDelta !== undefined && (typeof raw.maxDelta !== 'number' ||
+        !Number.isFinite(raw.maxDelta) || raw.maxDelta < 0 || raw.maxDelta > 1000000000))
+      throw new Error('单次最大变化必须是非负有限数字: ' + key);
     if (typeof raw.min === 'number' && typeof raw.max === 'number' && raw.min > raw.max) throw new Error('最小值不能大于最大值: ' + key);
     if (raw.updateEvery !== undefined &&
         (!Number.isSafeInteger(raw.updateEvery) || (raw.updateEvery as number) < 0 || (raw.updateEvery as number) > 1000))
@@ -123,6 +128,7 @@ export function parseContract(input: unknown): Contract {
       dependencies: [...deps],
       ...(raw.min !== undefined ? { min: raw.min as number } : {}),
       ...(raw.max !== undefined ? { max: raw.max as number } : {}),
+      ...(raw.maxDelta !== undefined ? { maxDelta: raw.maxDelta as number } : {}),
     };
     assertRuleValue(rule, rule.default);
     rules[key] = rule;

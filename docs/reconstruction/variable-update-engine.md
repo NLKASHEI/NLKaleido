@@ -9,7 +9,7 @@ Ready for integration testing: source code with pure scheduler, field-aware BM25
 ## Author flow
 
 1. Declare field name, type/default, natural-language change rule, optional dependencies.
-2. Select automatic check frequency in the author inspector. **Every reply is the default**, every 2/3/5 replies or disabled are available.
+2. Select automatic check frequency in the author inspector, and optionally set a numeric field's **single-update max delta** (a hard local guard against excessive jumps). **Every reply is the default**, every 2/3/5 replies or disabled are available.
 3. All automatic fields have a last-processed assistant logical turn. The scheduler groups similarly configured fields, never silently drops older turns if `batchSize` or `contextDepth` is low.
 4. Mandatory due-turn evidence goes into the observation even when the BM25F ranking score is zero. Extra, older evidence is ranked per field `title/tags/summary/body`.
 5. A provider receives a stable system instruction and dynamic, bounded observation. It proposes one explicit set/no-change decision per due field.

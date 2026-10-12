@@ -160,6 +160,10 @@ export function validateVariableDecisions(
     if(action==='set'){
       if(!Object.hasOwn(rawDecision,'value'))throw new Error('set 操作缺少值');
       assertRuleValue(rule,rawDecision.value);
+      if(rule.type==='number' && rule.maxDelta!==undefined &&
+         typeof prior==='number' && typeof rawDecision.value==='number' &&
+         Math.abs(rawDecision.value-prior)>rule.maxDelta)
+        throw new Error('单次变量变化超过作者设定的上限: '+rule.path);
       if(JSON.stringify(rawDecision.value)===JSON.stringify(prior))throw new Error('值未变化，应显式返回 unchanged');
       if(!ids.some(id=>observation.turns.includes(evidenceById.get(id)?.turn??-1)))
         throw new Error('更新必须引用至少一条本批次对话证据');
