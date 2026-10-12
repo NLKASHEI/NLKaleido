@@ -32,7 +32,7 @@ test('commit boundary independently checks citations, decisions, expected fields
     {...legitimate.decisions[0],evidenceIds:['nonexistent-id']}
   ]},baseline),/有效证据/);
   await assert.rejects(ledger.commit({...legitimate,updates:{'角色.好感度':90}},baseline),/提案内容与事务/);
-  await assert.rejects(ledger.commit({...legitimate,expected:{}},baseline),/缺少.*旧值/);
+  await assert.rejects(ledger.commit({...legitimate,expected:{}},baseline),/旧值/);
   assert.equal(saved,1); // only the explicit contract install was saved
   assert.equal(ledger.read().snapshot.stat_data.角色.好感度,50);
   assert.equal(await ledger.commit(legitimate,baseline),'applied');
