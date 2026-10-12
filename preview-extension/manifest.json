@@ -1,0 +1,11 @@
+{
+  "display_name": "NLKaleido · 新版作者工作台预览",
+  "loading_order": 200,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "author": "NLKASHEI",
+  "version": "0.0.1-alpha",
+  "homePage": "https://github.com/NLKASHEI/NLKaleido",
+  "auto_update": false
+}
