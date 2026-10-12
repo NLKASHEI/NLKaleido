@@ -1,12 +1,12 @@
 {
-    "display_name": "NLKaleido 万花筒",
-    "loading_order": 50,
-    "requires": [],
-    "optional": [],
-    "js": "dist/index.js",
-    "css": "",
-    "author": "NLKaleido",
-    "version": "0.10.0",
-    "homePage": "https://github.com/NLKASHEI/NLKaleido",
-    "auto_update": false
+  "display_name": "NLKaleido 万花筒",
+  "loading_order": 50,
+  "requires": [],
+  "optional": [],
+  "js": "dist/index.js",
+  "css": "",
+  "author": "NLKaleido",
+  "version": "0.11.0",
+  "homePage": "https://github.com/NLKASHEI/NLKaleido",
+  "auto_update": true
 }
