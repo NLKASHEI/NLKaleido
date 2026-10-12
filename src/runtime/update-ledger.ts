@@ -204,7 +204,7 @@ export function createStChatUpdateLedger(port:ChatLedgerPort){
         if(!rule||rule.updateMode==='manual'||rule.updateMode==='fixed')
           throw new Error('自动更新尝试操作非自动字段');
         const old=archive.watermarks[decision.path]??0;
-        const advanced=tx.advance[decision.path];
+        const advanced=tx.advance[decision.path]!;
         if(!Number.isSafeInteger(advanced)||advanced<=old||advanced>baseline.turns.length)
           throw new Error('字段处理进度越界或倒退');
         if(!Object.hasOwn(tx.expected,decision.path))
